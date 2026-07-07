@@ -1,0 +1,38 @@
+{
+  "longvideobench_full": {
+    "seed": 42,
+    "data": {
+      "name": "longvideobench",
+      "annotation_path": "${LONGBENCH_ANNOTATION_PATH}",
+      "video_root": "${LONGBENCH_VIDEO_ROOT}",
+      "video_search_dirs": ["videos", "video", "clips", "all_videos", ""],
+      "offset": 0,
+      "limit": 0
+    },
+    "output_dir": "outputs/full/longvideobench"
+  },
+  "cgbench_full": {
+    "seed": 42,
+    "data": {
+      "name": "cg-bench",
+      "annotation_path": "${CGBENCH_ANNOTATION_PATH}",
+      "video_root": "${CGBENCH_VIDEO_ROOT}",
+      "video_search_dirs": ["videos", "video", "clips", "all_videos", "clue_video", "clue_videos", ""],
+      "offset": 0,
+      "limit": 0
+    },
+    "output_dir": "outputs/full/cgbench"
+  },
+  "videomme_full": {
+    "seed": 42,
+    "data": {
+      "name": "video-mme",
+      "annotation_path": "${VIDEOMME_ANNOTATION_PATH}",
+      "video_root": "${VIDEOMME_VIDEO_ROOT}",
+      "video_search_dirs": ["videos", "video", "clips", "data", ""],
+      "offset": 0,
+      "limit": 0
+    },
+    "output_dir": "outputs/full/videomme"
+  }
+}

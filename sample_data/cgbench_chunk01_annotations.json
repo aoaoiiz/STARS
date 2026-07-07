@@ -1,0 +1,216 @@
+[
+  {
+    "qid": 50,
+    "video_uid": "07QhrrI5B4k",
+    "question": "In the video, when the heroine is holding a white skirt, what color is the thing on the right wrist of the girl sitting with one eye closed in the pop-up window on the right?",
+    "answer": "black",
+    "choices": [
+      "brown",
+      "black",
+      "red",
+      "blue",
+      "yellow",
+      "green",
+      "silver"
+    ],
+    "right_answer": "B",
+    "clue_intervals": [
+      [
+        60,
+        76
+      ]
+    ],
+    "domain": "Life Record",
+    "sub_category": "Entity Perception",
+    "duration": 1441
+  },
+  {
+    "qid": 80,
+    "video_uid": "07QhrrI5B4k",
+    "question": "In the video, when the heroine takes off her black glasses and holds them in both hands, what color is the frame of the glasses worn by the woman in white clothes in the pop-up window?",
+    "answer": "White",
+    "choices": [
+      "Silver",
+      "Cream",
+      "White",
+      "Alabaster",
+      "Pearl",
+      "Ivory",
+      "Champagne",
+      "Beige"
+    ],
+    "right_answer": "C",
+    "clue_intervals": [
+      [
+        354,
+        365
+      ]
+    ],
+    "domain": "Life Record",
+    "sub_category": "Entity Perception",
+    "duration": 1441
+  },
+  {
+    "qid": 204,
+    "video_uid": "-l2_zQBeEOo",
+    "question": "What is the long-haired man in white doing at 15 minutes and 50 seconds in the video?",
+    "answer": "Lying down",
+    "choices": [
+      "Lying down",
+      "Sitting up",
+      "Meditating quietly",
+      "Walking away",
+      "Holding a staff",
+      "Bending over",
+      "Standing still",
+      "Kneeling down"
+    ],
+    "right_answer": "A",
+    "clue_intervals": [
+      [
+        950,
+        960
+      ]
+    ],
+    "domain": "Electonic/Social Gaming",
+    "sub_category": "Time Perception",
+    "duration": 1944
+  },
+  {
+    "qid": 680,
+    "video_uid": "-YO14FM76lY",
+    "question": "When the white cat sits on the machine in the video, what are the English letters on the machine?",
+    "answer": "NOMA",
+    "choices": [
+      "NOMA8",
+      "NOMA",
+      "MONA",
+      "NOLA",
+      "NOMAD",
+      "NOMAC",
+      "NOAA",
+      "NOMAQ"
+    ],
+    "right_answer": "B",
+    "clue_intervals": [
+      [
+        77,
+        79
+      ]
+    ],
+    "domain": "Humor/funny",
+    "sub_category": "Text Perception",
+    "duration": 1105
+  },
+  {
+    "qid": 1085,
+    "video_uid": "02LnK6fEdJw",
+    "question": "In the video, after the protagonist put down the milk with a light blue bottle cap, what color bottle cap did he pick up?",
+    "answer": "Orange bottle cap of milk",
+    "choices": [
+      "Red bottle cap of milk",
+      "Black bottle cap of milk",
+      "Purple bottle cap of milk",
+      "White bottle cap of milk",
+      "Yellow bottle cap of milk",
+      "Green bottle cap of milk",
+      "Orange bottle cap of milk"
+    ],
+    "right_answer": "G",
+    "clue_intervals": [
+      [
+        48.13354136754587,
+        84.01490856880734
+      ]
+    ],
+    "domain": "Embodied Expert",
+    "sub_category": "Entity Perception",
+    "duration": 1526
+  },
+  {
+    "qid": 1211,
+    "video_uid": "02LnK6fEdJw",
+    "question": "When the barcode scanner in the video scans the paper form, where is the paper form placed?",
+    "answer": "Black plastic frame",
+    "choices": [
+      "Silver metal shelf",
+      "White plastic tray",
+      "Wooden clipboard",
+      "Black plastic frame",
+      "Green plastic bin",
+      "Blue metal rack"
+    ],
+    "right_answer": "D",
+    "clue_intervals": [
+      [
+        1260.3985844233057,
+        1304.0100643795995
+      ]
+    ],
+    "domain": "Embodied Expert",
+    "sub_category": "Scene Perception",
+    "duration": 1526
+  },
+  {
+    "qid": 1319,
+    "video_uid": "07QhrrI5B4k",
+    "question": "How many colors of lip gloss did the heroine in the video apply on her hands?",
+    "answer": "4 types",
+    "choices": [
+      "2 types",
+      "3 types",
+      "1 type",
+      "7 types",
+      "4 types",
+      "5 types",
+      "6 types"
+    ],
+    "right_answer": "E",
+    "clue_intervals": [
+      [
+        660,
+        675
+      ],
+      [
+        762,
+        780
+      ],
+      [
+        805,
+        811
+      ],
+      [
+        826,
+        839
+      ]
+    ],
+    "domain": "Life Record",
+    "sub_category": "Event Perception",
+    "duration": 1441
+  },
+  {
+    "qid": 1822,
+    "video_uid": "07QhrrI5B4k",
+    "question": "What did the heroine do in the video between [[15:47,15:56]]?",
+    "answer": "Take off the earrings and put them on",
+    "choices": [
+      "Fix her hair and adjust her hat",
+      "Pick up a ring and examine it",
+      "Switch to a different pair of earrings",
+      "Take off the earrings and put them on",
+      "Remove a bracelet and place it aside",
+      "Put on a necklace and adjust it",
+      "Take off a watch and set it down"
+    ],
+    "right_answer": "D",
+    "clue_intervals": [
+      [
+        947,
+        956
+      ]
+    ],
+    "domain": "Life Record",
+    "sub_category": "Time Perception",
+    "duration": 1441
+  }
+]

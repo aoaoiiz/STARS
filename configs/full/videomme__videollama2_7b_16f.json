@@ -1,0 +1,78 @@
+{
+  "seed": 42,
+  "data": {
+    "name": "video-mme",
+    "annotation_path": "${VIDEOMME_ANNOTATION_PATH}",
+    "video_root": "${VIDEOMME_VIDEO_ROOT}",
+    "video_search_dirs": [
+      "videos",
+      "video",
+      "clips",
+      "data",
+      ""
+    ],
+    "offset": 0,
+    "limit": 0
+  },
+  "sampling": {
+    "num_bins": 8,
+    "frames_per_bin": 2,
+    "max_frames": 16,
+    "synthetic_size": 224
+  },
+  "generation": {
+    "num_candidates": 4,
+    "target_duration_sec": 30,
+    "segments": 5,
+    "cta_position": "late",
+    "pace": "medium",
+    "information_density": "medium",
+    "selling_points": [
+      "visual evidence",
+      "subtitle cue",
+      "answer support"
+    ],
+    "risk_terms": [
+      "absolute",
+      "guaranteed",
+      "cure",
+      "risk-free",
+      "lowest price"
+    ]
+  },
+  "reward": {
+    "alignment_weight": 0.3,
+    "readability_weight": 0.15,
+    "rhythm_weight": 0.15,
+    "control_weight": 0.2,
+    "risk_weight": 0.05,
+    "text_reasoning_weight": 0.0,
+    "preference_margin": 0.08
+  },
+  "models": {
+    "mode": "open_source_full_dataset",
+    "active_video_model": "videollama2_7b_16f",
+    "active_text_reward_model": "",
+    "allow_heavy_model_load": true,
+    "endpoints": [
+      {
+        "id": "videollama2_7b_16f",
+        "name": "VideoLLaMA2-7B-16F",
+        "role": "multimodal_generator_and_aligner",
+        "provider": "openai_compatible",
+        "adapter": "chat_completions_multimodal",
+        "enabled": true,
+        "endpoint_url": "${VIDEOLLAMA2_ENDPOINT_URL}",
+        "api_key_env": "VLM_API_KEY",
+        "max_frames": 16,
+        "max_new_tokens": 1200,
+        "temperature": 0.3,
+        "request_timeout_sec": 300,
+        "retry_count": 2,
+        "trust_remote_code": true,
+        "notes": "OpenAI-compatible multimodal endpoint. Configure endpoint_url through environment variables."
+      }
+    ]
+  },
+  "output_dir": "outputs/full/videomme/videollama2_7b_16f"
+}
