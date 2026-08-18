@@ -86,6 +86,7 @@ def build_protocol_manifest(
             if isinstance(value, dict):
                 annotation_reference_protocol = value
     endpoints = []
+    runtime_endpoints = []
     for endpoint in config.models.endpoints:
         if not endpoint.enabled:
             continue
@@ -108,7 +109,6 @@ def build_protocol_manifest(
             "role": endpoint.role,
             "provider": endpoint.provider,
             "adapter": endpoint.adapter,
-            "local_path": endpoint.local_path,
             "max_frames": endpoint.max_frames,
             "max_new_tokens": endpoint.max_new_tokens,
             "temperature": endpoint.temperature,
@@ -121,6 +121,13 @@ def build_protocol_manifest(
             "trust_remote_code": endpoint.trust_remote_code,
             "checkpoint_identity": endpoint.checkpoint_identity,
             "checkpoint_manifest": checkpoint_manifest,
+            "runtime_identity": endpoint.runtime_identity,
+        })
+        runtime_endpoints.append({
+            "id": endpoint.id,
+            "local_path": endpoint.local_path,
+            "checkpoint_manifest_path": endpoint.checkpoint_manifest_path,
+            "endpoint_url": endpoint.endpoint_url,
         })
     actual_source_files = sorted(
         path.relative_to(root).as_posix()
@@ -171,6 +178,10 @@ def build_protocol_manifest(
         "protocol_fingerprint": sha256_json(scientific_payload),
         "scientific_payload": scientific_payload,
         "annotation_path": str(annotation_path),
+        "runtime_locations": {
+            "annotation_path": str(annotation_path),
+            "endpoints": runtime_endpoints,
+        },
         "input_fields": {
             "generation_and_reward": ["sampled_video_frames", "generic_script_contract"],
             "evaluation_only": [
@@ -319,9 +330,6 @@ def build_protocol_manifest(
                 "pathological token loops early without modifying candidate text"
             ),
             "direct_generation": (
-                "C1 when C1 is valid; otherwise an explicit method-level failure"
-            ),
-            "best_of_1": (
                 "C1 when C1 is valid; otherwise an explicit method-level failure"
             ),
             "stars_best_of_4": (

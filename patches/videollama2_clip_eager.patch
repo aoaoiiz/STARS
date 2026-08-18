@@ -1,0 +1,6 @@
+diff --git a/videollama2/model/encoder.py b/videollama2/model/encoder.py
+--- a/videollama2/model/encoder.py
++++ b/videollama2/model/encoder.py
+@@ -24 +24 @@ class CLIPVisionTower(nn.Module):
+-        config._attn_implementation = "flash_attention_2"
++        config._attn_implementation = "eager"

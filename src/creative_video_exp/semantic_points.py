@@ -129,13 +129,23 @@ class SemanticPointEvaluator:
         if not reference.available:
             return base
 
-        segment_texts = [
-            self._segment_text(segment, reference.text_fields)
-            for segment in candidate.timeline
+        indexed_segment_texts = [
+            (
+                index,
+                self._segment_text(segment, reference.text_fields),
+            )
+            for index, segment in enumerate(candidate.timeline, start=1)
         ]
-        segment_texts = [text for text in segment_texts if text]
+        indexed_segment_texts = [
+            (index, text)
+            for index, text in indexed_segment_texts
+            if text
+        ]
+        segment_indices = [index for index, _ in indexed_segment_texts]
+        segment_texts = [text for _, text in indexed_segment_texts]
         if not segment_texts:
             segment_texts = [normalize_text(candidate.text)] if candidate.text else []
+            segment_indices = [0] if segment_texts else []
         if not segment_texts:
             return {
                 **base,
@@ -170,7 +180,7 @@ class SemanticPointEvaluator:
                 round(float(score), 6) for score in best_scores
             ],
             "semantic_point_best_segment_indices": [
-                int(index) + 1 for index in best_indices
+                segment_indices[int(index)] for index in best_indices
             ],
         }
 

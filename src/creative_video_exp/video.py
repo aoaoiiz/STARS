@@ -65,6 +65,8 @@ class SparseFrameSampler:
                 "decode_strategy": "preextracted_frames",
                 "fallback_used": False,
                 "fallback_reason": "",
+                "temporal_coverage_status": "ordered_preextracted_frames",
+                "formal_sampling_eligible": True,
             }
         if path.suffix.lower() == ".npz":
             frames = _load_npz(path, self.config.image_size)
@@ -75,6 +77,8 @@ class SparseFrameSampler:
                 "decode_strategy": "preextracted_frames",
                 "fallback_used": False,
                 "fallback_reason": "",
+                "temporal_coverage_status": "ordered_preextracted_frames",
+                "formal_sampling_eligible": True,
             }
         frames, decode_strategy, failure_reason = _load_video_with_pyav(
             path,
@@ -82,11 +86,18 @@ class SparseFrameSampler:
             max_frames=max(self.config.max_frames * 2, self.config.num_bins * 2),
         )
         if len(frames):
+            fallback_used = decode_strategy != "duration_seek_uniform"
             return frames, "video", {
                 "decode_backend": "pyav",
                 "decode_strategy": decode_strategy,
-                "fallback_used": decode_strategy != "duration_seek_uniform",
+                "fallback_used": fallback_used,
                 "fallback_reason": failure_reason,
+                "temporal_coverage_status": (
+                    "duration_uniform_seek"
+                    if not fallback_used
+                    else "unverified_early_window"
+                ),
+                "formal_sampling_eligible": not fallback_used,
             }
         failure_reason = failure_reason or "PyAV returned no frames"
         raise RuntimeError(f"Unable to decode video input {path}: {failure_reason}")

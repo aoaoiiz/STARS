@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Iterable
 
 import numpy as np
@@ -12,6 +13,32 @@ PAPER_METRICS = (
     "semantic_point_coverage",
     "cider_lite",
     "rep",
+)
+EFFICIENCY_KEYS = (
+    "sampling_seconds",
+    "reward_encoding_seconds",
+    "generation_seconds",
+    "generation_requests",
+    "generation_input_tokens",
+    "generation_output_tokens",
+    "generation_total_tokens",
+    "reward_scoring_seconds",
+    "metric_evaluation_seconds",
+    "direct_generation_seconds",
+    "stars_seconds",
+    "direct_generation_input_tokens",
+    "stars_input_tokens",
+    "direct_generation_output_tokens",
+    "stars_output_tokens",
+    "direct_generation_total_tokens",
+    "stars_total_tokens",
+    "direct_generation_requests",
+    "stars_generation_requests",
+    "total_pipeline_seconds",
+    "vlm_server_peak_allocated_mib",
+    "vlm_server_peak_reserved_mib",
+    "reward_runner_peak_allocated_mib",
+    "reward_runner_peak_reserved_mib",
 )
 
 
@@ -36,7 +63,10 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             6,
         ),
         "real_video_rate": _mean(
-            float(result.get("sampling", {}).get("source_kind") != "synthetic")
+            float(
+                result.get("sampling", {}).get("source_kind")
+                in {"video", "image_dir", "npz"}
+            )
             for result in results
         ),
         "multimodal_generation_rate": _mean(
@@ -62,58 +92,49 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
-def _candidate_metrics(candidate: dict[str, Any]) -> dict[str, float | None]:
-    reward = candidate.get("reward", {})
-    quality = candidate.get("quality", {})
-    violations = reward.get("violations", reward.get("control_violations", []))
+def _candidate_metrics(candidate: dict[str, Any]) -> dict[str, float]:
+    reward = _required_mapping(candidate, "reward", "candidate")
+    quality = _required_mapping(candidate, "quality", "candidate")
+    violations = reward.get("violations")
+    if not isinstance(violations, list):
+        raise RuntimeError("candidate.reward.violations must be a list.")
     return {
-        "reward": float(reward.get("total", 0.0)),
-        "mv_align": float(reward.get("alignment", 0.0)),
-        "csr": float(not violations),
-        "semantic_point_coverage": _optional_float(
-            quality.get("semantic_point_coverage")
+        "reward": _required_unit_number(reward, "total", "candidate.reward"),
+        "mv_align": _required_unit_number(
+            reward,
+            "alignment",
+            "candidate.reward",
         ),
-        "cider_lite": float(quality.get("cider_lite", 0.0)),
-        "rep": float(quality.get("repetition_rate", 0.0)),
+        "csr": float(not violations),
+        "semantic_point_coverage": _required_unit_number(
+            quality,
+            "semantic_point_coverage",
+            "candidate.quality",
+        ),
+        "cider_lite": _required_unit_number(
+            quality,
+            "cider_lite",
+            "candidate.quality",
+        ),
+        "rep": _required_unit_number(
+            quality,
+            "repetition_rate",
+            "candidate.quality",
+        ),
     }
 
 
 def _efficiency_summary(results: list[dict[str, Any]]) -> dict[str, float]:
-    keys = (
-        "sampling_seconds",
-        "reward_encoding_seconds",
-        "generation_seconds",
-        "generation_requests",
-        "generation_input_tokens",
-        "generation_output_tokens",
-        "generation_total_tokens",
-        "reward_scoring_seconds",
-        "metric_evaluation_seconds",
-        "direct_generation_seconds",
-        "stars_seconds",
-        "direct_generation_input_tokens",
-        "stars_input_tokens",
-        "direct_generation_output_tokens",
-        "stars_output_tokens",
-        "direct_generation_total_tokens",
-        "stars_total_tokens",
-        "direct_generation_requests",
-        "stars_generation_requests",
-        "total_pipeline_seconds",
-        "vlm_server_peak_allocated_mib",
-        "vlm_server_peak_reserved_mib",
-        "reward_runner_peak_allocated_mib",
-        "reward_runner_peak_reserved_mib",
-    )
+    efficiency_rows = [
+        _required_mapping(result, "efficiency", "result")
+        for result in results
+    ]
     summary: dict[str, float] = {}
-    for key in keys:
+    for key in EFFICIENCY_KEYS:
         values = [
-            float(result["efficiency"][key])
-            for result in results
-            if key in result.get("efficiency", {})
+            _required_nonnegative_number(row, key, "result.efficiency")
+            for row in efficiency_rows
         ]
-        if not values:
-            continue
         summary[f"mean_{key}"] = round(float(np.mean(values)), 6)
         summary[f"median_{key}"] = round(float(np.median(values)), 6)
         summary[f"p95_{key}"] = round(float(np.percentile(values, 95)), 6)
@@ -189,7 +210,50 @@ def _counts(values: Iterable[Any]) -> dict[str, int]:
     return counts
 
 
-def _optional_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    return float(value)
+def _required_mapping(
+    payload: dict[str, Any],
+    key: str,
+    context: str,
+) -> dict[str, Any]:
+    value = payload.get(key)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{context}.{key} must be an object.")
+    return value
+
+
+def _required_number(
+    payload: dict[str, Any],
+    key: str,
+    context: str,
+) -> float:
+    if key not in payload:
+        raise RuntimeError(f"Missing required field {context}.{key}.")
+    value = payload[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(f"{context}.{key} must be numeric.")
+    number = float(value)
+    if not math.isfinite(number):
+        raise RuntimeError(f"{context}.{key} must be finite.")
+    return number
+
+
+def _required_nonnegative_number(
+    payload: dict[str, Any],
+    key: str,
+    context: str,
+) -> float:
+    number = _required_number(payload, key, context)
+    if number < 0.0:
+        raise RuntimeError(f"{context}.{key} must be non-negative.")
+    return number
+
+
+def _required_unit_number(
+    payload: dict[str, Any],
+    key: str,
+    context: str,
+) -> float:
+    number = _required_number(payload, key, context)
+    if not 0.0 <= number <= 1.0:
+        raise RuntimeError(f"{context}.{key} must be within [0, 1].")
+    return number

@@ -114,7 +114,7 @@ def _row_to_sample(row: dict[str, Any], config: DataConfig, project_root: str | 
         "youtube_id",
         "name",
     )
-    video_path = _first(
+    explicit_video_path = _first(
         row,
         "video_path",
         "video_file",
@@ -125,11 +125,32 @@ def _row_to_sample(row: dict[str, Any], config: DataConfig, project_root: str | 
         "url",
         "video_url",
     )
+    video_lookup_id = _first(
+        row,
+        "videoID",
+        "youtube_id",
+        "video_id",
+        "video_uid",
+        "video_name",
+        "video",
+        "id",
+        "uid",
+        "name",
+    )
     video_roots = _resolve_video_roots(config, project_root)
-    if video_path:
-        video_path = _resolve_video_path(str(video_path), video_roots, project_root)
-    elif video_roots and video_id:
-        video_path = _guess_video_path(video_roots, str(video_id), config.video_search_dirs)
+    video_path = ""
+    if explicit_video_path and not _is_remote_url(str(explicit_video_path)):
+        video_path = _resolve_video_path(
+            str(explicit_video_path).strip(),
+            video_roots,
+            project_root,
+        )
+    elif video_roots and video_lookup_id:
+        video_path = _guess_video_path(
+            video_roots,
+            normalize_text(video_lookup_id),
+            config.video_search_dirs,
+        )
 
     caption = " ".join(
         part
@@ -377,6 +398,8 @@ def _resolve_video_path(
     video_roots: list[Path],
     project_root: str | Path | None,
 ) -> str:
+    if _is_remote_url(video_path):
+        return ""
     candidate = Path(video_path)
     if candidate.is_absolute():
         return str(candidate)
@@ -387,6 +410,15 @@ def _resolve_video_path(
     if video_roots:
         return str(video_roots[0] / candidate)
     return str(resolve_path(video_path, project_root))
+
+
+def _is_remote_url(value: str) -> bool:
+    normalized = value.strip()
+    if re.match(r"^[A-Za-z]:[\\/]", normalized):
+        return False
+    return normalized.startswith("//") or bool(
+        re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", normalized)
+    )
 
 
 def _guess_video_path(roots: list[Path], video_id: str, search_dirs: list[str]) -> str:

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import base64
+import http.client
 import io
 import os
 import re
+import socket
 import time
 import unicodedata
 import urllib.error
@@ -134,7 +136,7 @@ class OpenAICompatibleScriptGenerationModel:
         base_prompt_sha256 = sha256_text(base_prompt)
         retry_prompt_sha256 = sha256_text(retry_prompt)
         max_parse_attempts = max(1, int(config.parse_retry_count) + 1)
-        sample_seed_offset = stable_hash_int(sample.video_id or "unknown", 1_000_000)
+        sample_seed_shift = stable_hash_int(sample.video_id or "unknown", 1_000_000)
         request_prompt_hashes: list[str] = []
 
         for candidate_index in range(1, config.num_candidates + 1):
@@ -159,7 +161,7 @@ class OpenAICompatibleScriptGenerationModel:
                 )
                 request_seed = int(
                     self.endpoint.seed
-                    + sample_seed_offset
+                    + sample_seed_shift
                     + candidate_index * 10_000
                     + parse_attempt - 1
                 )
@@ -543,6 +545,7 @@ def build_frame_encoder(model_suite: ModelSuiteConfig) -> tuple[Any, dict[str, A
         model_path=endpoint.local_path,
         device=endpoint.device_map,
         dtype=endpoint.dtype,
+        checkpoint_manifest_path=endpoint.checkpoint_manifest_path,
     )
     encoder.model_report["model_id"] = endpoint.id
     return encoder, dict(encoder.model_report)
@@ -556,10 +559,14 @@ def build_script_generation_model(model_suite: ModelSuiteConfig) -> ScriptGenera
         )
     if not endpoint.enabled:
         raise ValueError(f"Generation model `{endpoint.id}` is disabled.")
-    if endpoint.provider not in {"openai_compatible", "openai"}:
+    if endpoint.provider != "openai_compatible":
         raise ValueError(
             "STARS requires an OpenAI-compatible multimodal generation endpoint; "
             f"received provider `{endpoint.provider}`."
+        )
+    if endpoint.adapter != "chat_completions_multimodal":
+        raise ValueError(
+            "STARS requires the chat_completions_multimodal adapter."
         )
     return OpenAICompatibleScriptGenerationModel(endpoint)
 
@@ -654,6 +661,8 @@ def _post_chat_completion(endpoint: ModelEndpointConfig, payload: dict[str, Any]
         try:
             with urllib.request.urlopen(request, timeout=endpoint.request_timeout_sec) as response:
                 response_payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(response_payload, dict):
+                raise TypeError("Endpoint response must be a JSON object.")
             request_seconds = time.perf_counter() - transport_started
             usage = _usage_counts(response_payload)
             transport_attempts.append(
@@ -678,6 +687,9 @@ def _post_chat_completion(endpoint: ModelEndpointConfig, payload: dict[str, Any]
         except (
             urllib.error.URLError,
             TimeoutError,
+            ConnectionError,
+            http.client.HTTPException,
+            socket.timeout,
             UnicodeDecodeError,
             json.JSONDecodeError,
             KeyError,
@@ -695,25 +707,63 @@ def _post_chat_completion(endpoint: ModelEndpointConfig, payload: dict[str, Any]
                 "error": str(exc),
                 "usage": dict(_ZERO_USAGE),
             }
-            if attempt + 1 < attempts:
+            retryable = _is_retryable_transport_error(exc)
+            record["retryable"] = retryable
+            if retryable and attempt + 1 < attempts:
                 backoff_started = time.perf_counter()
                 time.sleep(min(8.0, 1.5 * (attempt + 1)))
                 backoff_seconds = time.perf_counter() - backoff_started
                 record["backoff_seconds_after"] = round(backoff_seconds, 6)
                 total_backoff_seconds += backoff_seconds
             transport_attempts.append(record)
-    audit = {
-        "attempts": transport_attempts,
-        "request_count": len(transport_attempts),
-        "request_seconds": round(
-            sum(float(item["request_seconds"]) for item in transport_attempts), 6
-        ),
-        "backoff_seconds": round(total_backoff_seconds, 6),
-    }
+            if not retryable:
+                audit = _transport_audit_payload(
+                    transport_attempts,
+                    total_backoff_seconds,
+                )
+                raise _TransportRequestError(str(exc), audit) from exc
+    audit = _transport_audit_payload(transport_attempts, total_backoff_seconds)
     raise _TransportRequestError(
         str(last_error) if last_error else "unknown endpoint error",
         audit,
     )
+
+
+def _is_retryable_transport_error(error: Exception) -> bool:
+    if isinstance(error, urllib.error.HTTPError):
+        return int(error.code) in {408, 409, 425, 429, 500, 502, 503, 504}
+    if isinstance(error, urllib.error.URLError):
+        return True
+    if isinstance(
+        error,
+        (
+            TimeoutError,
+            ConnectionError,
+            socket.timeout,
+            http.client.RemoteDisconnected,
+            http.client.IncompleteRead,
+            http.client.NotConnected,
+            http.client.CannotSendRequest,
+            http.client.ResponseNotReady,
+        ),
+    ):
+        return True
+    return isinstance(error, (UnicodeDecodeError, json.JSONDecodeError))
+
+
+def _transport_audit_payload(
+    attempts: list[dict[str, Any]],
+    total_backoff_seconds: float,
+) -> dict[str, Any]:
+    return {
+        "attempts": attempts,
+        "request_count": len(attempts),
+        "request_seconds": round(
+            sum(float(item["request_seconds"]) for item in attempts),
+            6,
+        ),
+        "backoff_seconds": round(total_backoff_seconds, 6),
+    }
 
 
 def _message_content(response_payload: dict[str, Any]) -> str:
@@ -756,27 +806,8 @@ def _generation_request_payload(
     batch: SparseFrameBatch,
     seed: int,
 ) -> dict[str, Any]:
-    if endpoint.adapter == "openai_responses_multimodal":
-        images = [
-            {
-                "type": "input_image",
-                "image_url": item["image_url"]["url"],
-            }
-            for item in _frame_content(batch, endpoint.max_frames)
-        ]
-        return {
-            "model": endpoint.name,
-            "input": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": prompt},
-                        *images,
-                    ],
-                }
-            ],
-            "max_output_tokens": endpoint.max_new_tokens,
-        }
+    if endpoint.adapter != "chat_completions_multimodal":
+        raise ValueError("STARS requires the chat-completions multimodal adapter.")
     return {
         "model": endpoint.name,
         "temperature": endpoint.temperature,
@@ -798,32 +829,40 @@ def _generation_response_content(
     endpoint: ModelEndpointConfig,
     response_payload: dict[str, Any],
 ) -> str:
-    if endpoint.adapter != "openai_responses_multimodal":
-        return _message_content(response_payload)
-    parts: list[str] = []
-    for output_item in response_payload.get("output", []):
-        if not isinstance(output_item, dict):
-            continue
-        for content_item in output_item.get("content", []):
-            if not isinstance(content_item, dict):
-                continue
-            if content_item.get("type") == "output_text":
-                parts.append(normalize_text(content_item.get("text", "")))
-    return "\n".join(part for part in parts if part)
+    if endpoint.adapter != "chat_completions_multimodal":
+        raise ValueError("STARS requires the chat-completions multimodal adapter.")
+    return _message_content(response_payload)
 
 
 def _usage_counts(response_payload: dict[str, Any]) -> dict[str, int]:
     usage = response_payload.get("usage") or {}
-    input_tokens = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
-    output_tokens = int(
-        usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
+    if not isinstance(usage, dict):
+        raise RuntimeError("Endpoint usage must be an object.")
+    input_tokens = _token_count(
+        usage.get("input_tokens", usage.get("prompt_tokens", 0)),
+        "input tokens",
     )
-    total_tokens = int(usage.get("total_tokens", input_tokens + output_tokens) or 0)
+    output_tokens = _token_count(
+        usage.get("output_tokens", usage.get("completion_tokens", 0)),
+        "output tokens",
+    )
+    total_tokens = _token_count(
+        usage.get("total_tokens", input_tokens + output_tokens),
+        "total tokens",
+    )
+    if total_tokens != input_tokens + output_tokens:
+        raise RuntimeError("Endpoint total tokens must equal input plus output tokens.")
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
     }
+
+
+def _token_count(value: Any, context: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RuntimeError(f"Endpoint {context} must be a non-negative integer.")
+    return value
 
 
 def _server_metrics(response_payload: dict[str, Any]) -> dict[str, Any]:
@@ -834,6 +873,23 @@ def _server_metrics(response_payload: dict[str, Any]) -> dict[str, Any]:
     for key, value in payload.items():
         if isinstance(value, (str, int, float, bool)) or value is None:
             clean[str(key)] = value
+    runtime_identity = payload.get("generation_runtime_identity")
+    if runtime_identity is not None:
+        if not isinstance(runtime_identity, dict):
+            raise RuntimeError("generation_runtime_identity must be an object.")
+        try:
+            clean["generation_runtime_identity"] = json.loads(
+                json.dumps(
+                    runtime_identity,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "generation_runtime_identity must contain JSON-safe values."
+            ) from exc
     returned_model_id = response_payload.get("model")
     if isinstance(returned_model_id, str) and returned_model_id.strip():
         returned_model_id = returned_model_id.strip()

@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         required=True,
-        help="Complete official annotation JSON path.",
+        help="Complete row-level annotation JSON path derived from the official data.",
     )
     parser.add_argument("--output", required=True, help="New SPC manifest JSON path.")
     parser.add_argument(

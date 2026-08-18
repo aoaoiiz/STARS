@@ -73,6 +73,7 @@ class Siglip2FrameEncoder:
         dtype: str = "bfloat16",
         centrality_weight: float = 0.55,
         aggregation_temperature: float = 0.35,
+        checkpoint_manifest_path: str = "",
     ):
         try:
             import torch
@@ -111,12 +112,12 @@ class Siglip2FrameEncoder:
         self.tag_labels, tag_prompts, self.tag_group_slices = self._tag_taxonomy()
         self.tag_embeddings = self._encode_texts(tag_prompts)
         checkpoint_identity: dict[str, Any] = {}
-        checkpoint_manifest_path = os.environ.get(
+        resolved_manifest_path = str(checkpoint_manifest_path).strip() or os.environ.get(
             "REWARD_VISION_CHECKPOINT_MANIFEST",
             "",
         ).strip()
-        if checkpoint_manifest_path:
-            checkpoint_manifest = load_checkpoint_manifest(checkpoint_manifest_path)
+        if resolved_manifest_path:
+            checkpoint_manifest = load_checkpoint_manifest(resolved_manifest_path)
             checkpoint_identity = checkpoint_identity_summary(checkpoint_manifest)
             if checkpoint_identity["model_id"] != "google/siglip2-so400m-patch14-384":
                 raise RuntimeError(

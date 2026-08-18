@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import math
 import platform
 import sys
 import time
@@ -21,7 +22,10 @@ from creative_video_exp.checkpoint_identity import (
     LOCAL_CHECKPOINT_KIND,
     validate_checkpoint_identity,
 )
-from creative_video_exp.config import ExperimentConfig
+from creative_video_exp.config import (
+    ExperimentConfig,
+    validate_videollama2_runtime_identity,
+)
 from creative_video_exp.data import load_samples
 from creative_video_exp.failure_aware_postprocessing import (
     analyze_failure_aware_candidate_pool,
@@ -202,13 +206,37 @@ def _validate_runtime_reward_identity(
         )
 
 
+def _generation_infrastructure_issue(attempt: dict[str, Any]) -> str:
+    if attempt.get("status") == "endpoint_error":
+        return "contains an endpoint error"
+    if attempt.get("infrastructure_error") is True:
+        return "is marked as an infrastructure error"
+    transport_attempts = attempt.get("transport_attempts")
+    if not isinstance(transport_attempts, list) or not transport_attempts:
+        return "has no auditable transport attempts"
+    for transport in transport_attempts:
+        if not isinstance(transport, dict):
+            return "contains a malformed transport attempt"
+        status = transport.get("status")
+        if status == "error":
+            return "contains a failed transport attempt"
+        if status != "success":
+            return "contains a transport attempt with an invalid status"
+    return ""
+
+
 def _validate_runtime_generation_identity(
     config: ExperimentConfig,
     generation_trace: list[dict[str, Any]],
+    expected_visual_frames: int,
 ) -> None:
     endpoint = config.models.get(config.models.active_video_model)
     if endpoint is None:
         raise RuntimeError("The active generation endpoint cannot be resolved.")
+    if not 1 <= expected_visual_frames <= config.sampling.max_frames:
+        raise RuntimeError(
+            "The sparse observation must contain between one and 16 frames."
+        )
     expected = endpoint.checkpoint_identity
     expected_fields = {
         "checkpoint_identity_sha256": expected.get("identity_sha256"),
@@ -223,13 +251,44 @@ def _validate_runtime_generation_identity(
                 f"Candidate slot C{candidate_index} has no generation trace."
             )
         for attempt_position, attempt in enumerate(attempts, start=1):
-            if attempt.get("status") == "endpoint_error":
-                continue
+            if not isinstance(attempt, dict):
+                raise RuntimeError(
+                    f"C{candidate_index} attempt {attempt_position} is not an object."
+                )
+            infrastructure_issue = _generation_infrastructure_issue(attempt)
+            if infrastructure_issue:
+                raise RuntimeError(
+                    f"C{candidate_index} attempt {attempt_position} "
+                    f"{infrastructure_issue}."
+                )
             server_metrics = attempt.get("server_metrics")
             if not isinstance(server_metrics, dict):
                 raise RuntimeError(
                     f"C{candidate_index} attempt {attempt_position} lacks model identity metadata."
                 )
+            if server_metrics.get("server_protocol_version") != PROTOCOL_NAME:
+                raise RuntimeError(
+                    f"C{candidate_index} attempt {attempt_position} used an unexpected server protocol."
+                )
+            if server_metrics.get("configured_max_frames") != 16:
+                raise RuntimeError(
+                    f"C{candidate_index} attempt {attempt_position} used an unexpected service frame cap."
+                )
+            for field in (
+                "requested_visual_input_frames",
+                "visual_input_frames",
+            ):
+                observed_frames = server_metrics.get(field)
+                if (
+                    isinstance(observed_frames, bool)
+                    or not isinstance(observed_frames, int)
+                    or observed_frames != expected_visual_frames
+                ):
+                    raise RuntimeError(
+                        f"C{candidate_index} attempt {attempt_position} reports "
+                        f"{field}={observed_frames!r}; expected "
+                        f"{expected_visual_frames}."
+                    )
             if server_metrics.get("returned_model_id_conflict") is True:
                 raise RuntimeError(
                     f"C{candidate_index} attempt {attempt_position} reports conflicting model identities."
@@ -244,6 +303,12 @@ def _validate_runtime_generation_identity(
             if observed_fields != expected_fields:
                 raise RuntimeError(
                     f"C{candidate_index} attempt {attempt_position} used an unexpected checkpoint."
+                )
+            if endpoint.runtime_identity and server_metrics.get(
+                "generation_runtime_identity"
+            ) != endpoint.runtime_identity:
+                raise RuntimeError(
+                    f"C{candidate_index} attempt {attempt_position} used an unexpected model runtime."
                 )
 
 
@@ -284,6 +349,9 @@ def main() -> None:
     args = parse_args()
     config = ExperimentConfig.from_file(args.config)
     _validate_config(config)
+    generation_endpoint = config.models.get(config.models.active_video_model)
+    if generation_endpoint is None:
+        raise RuntimeError("The active generation endpoint cannot be resolved.")
     set_seed(config.seed)
     output_dir = ensure_dir(PROJECT_ROOT / config.output_dir)
     protocol_manifest = build_protocol_manifest(config, PROJECT_ROOT)
@@ -302,6 +370,8 @@ def main() -> None:
         existing_results,
         expected_sample_keys,
         protocol_fingerprint,
+        generation_checkpoint_identity=generation_endpoint.checkpoint_identity,
+        generation_runtime_identity=generation_endpoint.runtime_identity,
     )
     if not args.resume:
         results_path.write_text("", encoding="utf-8")
@@ -338,9 +408,39 @@ def main() -> None:
             metadata={"input_protocol": "visual_only"},
         )
         sampling_seconds = time.perf_counter() - sampling_started
-        if batch.source_kind == "synthetic":
+        if batch.source_kind not in {"video", "image_dir", "npz"}:
             raise RuntimeError(
                 f"Real video frames could not be loaded for `{sample.video_id}`."
+            )
+        if batch.metadata.get("fallback_used") is True:
+            raise RuntimeError(
+                f"Formal temporal decoding fell back for `{sample.video_id}`."
+            )
+        if batch.metadata.get("formal_sampling_eligible") is not True:
+            raise RuntimeError(
+                f"Temporal sampling is not formally eligible for `{sample.video_id}`."
+            )
+        sampled_frame_count = len(batch.frames)
+        if (
+            not 1 <= sampled_frame_count <= config.sampling.max_frames
+            or len(batch.selected_indices) != sampled_frame_count
+            or len(batch.bin_ids) != sampled_frame_count
+            or batch.selected_indices != sorted(set(batch.selected_indices))
+            or any(
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or index < 0
+                for index in batch.selected_indices
+            )
+            or any(
+                isinstance(bin_id, bool)
+                or not isinstance(bin_id, int)
+                or not 0 <= bin_id < config.sampling.num_bins
+                for bin_id in batch.bin_ids
+            )
+        ):
+            raise RuntimeError(
+                f"Sparse-observation accounting is invalid for `{sample.video_id}`."
             )
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
@@ -370,7 +470,11 @@ def main() -> None:
             generation_model.model_report,
             CANDIDATE_SLOTS,
         )
-        _validate_runtime_generation_identity(config, generation_trace)
+        _validate_runtime_generation_identity(
+            config,
+            generation_trace,
+            sampled_frame_count,
+        )
         server_metrics = list(
             generation_model.model_report.get("last_slot_server_metrics", [])
         )
@@ -697,7 +801,17 @@ def main() -> None:
         results,
         expected_sample_keys,
         protocol_fingerprint,
+        generation_checkpoint_identity=generation_endpoint.checkpoint_identity,
+        generation_runtime_identity=generation_endpoint.runtime_identity,
     )
+    if audit["evidence_eligible"] is not True:
+        raise RuntimeError(
+            "The completed result set failed the formal contract audit: "
+            f"duplicates={audit['duplicate_result_sample_keys'][:5]}, "
+            f"missing={audit['missing_manifest_sample_keys'][:5]}, "
+            f"unexpected={audit['unexpected_result_sample_keys'][:5]}, "
+            f"row_issues={audit['slot_accounting_issues'][:5]}."
+        )
     candidate_summary, candidate_selections = (
         analyze_failure_aware_candidate_pool(
             results=results,
@@ -744,6 +858,11 @@ def main() -> None:
     metrics["metric_wise_best_of_4_upper_bound"] = candidate_summary[
         "metric_wise_best_of_4_upper_bound"
     ]
+    metrics["metric_wise_best_of_4_upper_bound_definition"] = (
+        candidate_summary[
+            "metric_wise_best_of_4_upper_bound_definition"
+        ]
+    )
     write_json(output_dir / "metrics.json", metrics)
     write_markdown_report(output_dir / "metrics_report.md", metrics)
     run_status = {
@@ -900,6 +1019,9 @@ def _run_audit(
     results: list[dict[str, Any]],
     expected_sample_keys: list[str],
     protocol_fingerprint: str,
+    *,
+    generation_checkpoint_identity: dict[str, Any] | None = None,
+    generation_runtime_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     expected = set(expected_sample_keys)
     observed_keys = [str(result.get("sample_key", "")) for result in results]
@@ -914,7 +1036,12 @@ def _run_audit(
     failed_slots = 0
     full_pools = 0
     for result in results:
-        issue = _result_contract_issue(result, protocol_fingerprint)
+        issue = _result_contract_issue(
+            result,
+            protocol_fingerprint,
+            generation_checkpoint_identity=generation_checkpoint_identity,
+            generation_runtime_identity=generation_runtime_identity,
+        )
         if issue:
             row_issues.append(
                 {
@@ -965,6 +1092,9 @@ def _run_audit(
 def _result_contract_issue(
     result: dict[str, Any],
     protocol_fingerprint: str,
+    *,
+    generation_checkpoint_identity: dict[str, Any] | None = None,
+    generation_runtime_identity: dict[str, Any] | None = None,
 ) -> str:
     if result.get("experiment_version") != PROTOCOL_NAME:
         return "experiment_version is invalid"
@@ -974,56 +1104,561 @@ def _result_contract_issue(
         return "prompt_version is invalid"
     if result.get("generation_source") != "multimodal_model":
         return "generation source is not a multimodal model"
-    if result.get("sampling", {}).get("source_kind") == "synthetic":
-        return "video sampling used synthetic frames"
+    sampling = result.get("sampling")
+    if not isinstance(sampling, dict):
+        return "sampling metadata is missing"
+    if sampling.get("source_kind") not in {"video", "image_dir", "npz"}:
+        return "video sampling did not use a supported real source"
+    if sampling.get("fallback_used") is True:
+        return "video sampling used a temporal decoding fallback"
+    if sampling.get("formal_sampling_eligible") is not True:
+        return "video sampling is not formally eligible"
+    selected_indices = sampling.get("selected_indices")
+    bin_ids = sampling.get("bin_ids")
+    if (
+        not isinstance(selected_indices, list)
+        or not selected_indices
+        or len(selected_indices) > 16
+        or any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0
+            for index in selected_indices
+        )
+        or selected_indices != sorted(set(selected_indices))
+    ):
+        return "sampled-frame indices are invalid"
+    if (
+        not isinstance(bin_ids, list)
+        or len(bin_ids) != len(selected_indices)
+        or any(
+            isinstance(bin_id, bool)
+            or not isinstance(bin_id, int)
+            or not 0 <= bin_id < 8
+            for bin_id in bin_ids
+        )
+    ):
+        return "sampled-frame bin accounting is invalid"
+    expected_visual_frames = len(selected_indices)
     if int(result.get("requested_candidate_slots", 0)) != CANDIDATE_SLOTS:
         return "requested slot count is invalid"
     slots = result.get("slot_outcomes")
     if not isinstance(slots, list) or len(slots) != CANDIDATE_SLOTS:
         return "slot outcomes are incomplete"
     candidates = result.get("candidates", [])
-    candidates_by_index = {
-        int(candidate.get("candidate_index", 0)): candidate
-        for candidate in candidates
-    }
+    if not isinstance(candidates, list):
+        return "candidates is not a list"
+    if any(not isinstance(candidate, dict) for candidate in candidates):
+        return "a scored candidate is not an object"
+    try:
+        candidates_by_index = {
+            int(candidate.get("candidate_index", 0)): candidate
+            for candidate in candidates
+        }
+    except (TypeError, ValueError):
+        return "a candidate index is invalid"
     if len(candidates_by_index) != len(candidates):
         return "candidate indices are duplicated"
+    valid_candidate_indices: set[int] = set()
     for expected_index, slot in enumerate(slots, start=1):
-        if int(slot.get("candidate_index", 0)) != expected_index:
+        try:
+            candidate_index = int(slot.get("candidate_index", 0))
+        except (TypeError, ValueError):
+            return "a slot candidate index is invalid"
+        if candidate_index != expected_index:
             return "slot outcomes are not ordered C1-C4"
         status = slot.get("terminal_status")
         if status not in {"valid", "failed"}:
             return "a slot has an invalid terminal status"
         if (status == "valid") != (expected_index in candidates_by_index):
             return "valid slots and scored candidates do not match"
+        expected_candidate = candidates_by_index.get(expected_index)
+        expected_candidate_id = (
+            expected_candidate.get("candidate_id")
+            if expected_candidate is not None
+            else None
+        )
+        if slot.get("candidate_id") != expected_candidate_id:
+            return "slot and scored-candidate identifiers do not match"
+        if status == "valid":
+            valid_candidate_indices.add(expected_index)
         attempts = slot.get("attempts")
         if not isinstance(attempts, list) or not attempts:
             return "a slot has no auditable attempts"
+        if len(attempts) > PARSE_RETRY_COUNT + 1:
+            return "a slot exceeds the bounded semantic-attempt count"
+        accepted_attempts = 0
+        for attempt_position, attempt in enumerate(attempts, start=1):
+            if not isinstance(attempt, dict):
+                return "a generation attempt is not an object"
+            if attempt.get("attempt") != attempt_position:
+                return "generation attempts are not consecutively numbered"
+            expected_prompt_kind = (
+                "base_generation"
+                if attempt_position == 1
+                else "validation_retry"
+            )
+            if attempt.get("prompt_kind") != expected_prompt_kind:
+                return "a generation attempt used an invalid prompt kind"
+            attempt_status = attempt.get("status")
+            if attempt_status not in {"accepted", "parse_rejected", "endpoint_error"}:
+                return "a generation attempt has an invalid status"
+            accepted_attempts += int(attempt_status == "accepted")
+            infrastructure_issue = _generation_infrastructure_issue(attempt)
+            if infrastructure_issue:
+                return f"a generation attempt {infrastructure_issue}"
+            server_metrics = attempt.get("server_metrics")
+            if not isinstance(server_metrics, dict):
+                return "a successful server response lacks server metrics"
+            if server_metrics.get("server_protocol_version") != PROTOCOL_NAME:
+                return "a successful server response used an invalid protocol"
+            if server_metrics.get("configured_max_frames") != 16:
+                return "a successful server response used an invalid service frame cap"
+            for field in (
+                "requested_visual_input_frames",
+                "visual_input_frames",
+            ):
+                observed_frames = server_metrics.get(field)
+                if (
+                    isinstance(observed_frames, bool)
+                    or not isinstance(observed_frames, int)
+                    or observed_frames != expected_visual_frames
+                ):
+                    return (
+                        "a successful server response used a mismatched "
+                        "visual-frame count"
+                    )
+            if server_metrics.get("returned_model_id_conflict") is True:
+                return "a successful server response has conflicting model identities"
+            if generation_checkpoint_identity:
+                expected_fields = {
+                    "checkpoint_identity_sha256": generation_checkpoint_identity.get(
+                        "identity_sha256"
+                    ),
+                    "checkpoint_model_id": generation_checkpoint_identity.get(
+                        "model_id"
+                    ),
+                    "checkpoint_revision": generation_checkpoint_identity.get(
+                        "revision"
+                    ),
+                }
+                if {
+                    key: server_metrics.get(key) for key in expected_fields
+                } != expected_fields:
+                    return "a successful server response used an unexpected checkpoint"
+                if server_metrics.get("returned_model_id") != expected_fields[
+                    "checkpoint_model_id"
+                ]:
+                    return "a successful server response used an unexpected model"
+            if generation_runtime_identity and server_metrics.get(
+                "generation_runtime_identity"
+            ) != generation_runtime_identity:
+                return "a successful server response used an unexpected model runtime"
+            if server_metrics.get("checkpoint_model_id") == "VideoLLaMA2-7B-16F":
+                runtime_identity = server_metrics.get(
+                    "generation_runtime_identity"
+                )
+                try:
+                    validate_videollama2_runtime_identity(runtime_identity)
+                except ValueError as exc:
+                    return str(exc)
+        if (status == "valid") != (accepted_attempts == 1):
+            return "slot status and accepted semantic attempt disagree"
+        if accepted_attempts and attempts[-1].get("status") != "accepted":
+            return "an accepted semantic attempt is not terminal"
         try:
-            _usage(slot.get("usage", {}))
+            accounting_issue = _slot_accounting_issue(slot, attempts, expected_index)
         except RuntimeError as exc:
             return str(exc)
+        if accounting_issue:
+            return accounting_issue
+    if set(candidates_by_index) != valid_candidate_indices:
+        return "scored candidate indices do not match valid slots"
+    try:
+        efficiency_issue = _efficiency_accounting_issue(
+            result,
+            slots,
+            expected_visual_frames,
+        )
+    except RuntimeError as exc:
+        return str(exc)
+    if efficiency_issue:
+        return efficiency_issue
+    valid_count = len(valid_candidate_indices)
+    aggregate_expectations = {
+        "valid_candidate_slots": valid_count,
+        "failed_candidate_slots": CANDIDATE_SLOTS - valid_count,
+        "candidate_pool_size": valid_count,
+    }
+    for key, expected_value in aggregate_expectations.items():
+        value = result.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value != expected_value:
+            return f"{key} does not match the terminal slot records"
+    if result.get("full_candidate_pool") is not (valid_count == CANDIDATE_SLOTS):
+        return "full_candidate_pool does not match the terminal slot records"
+    if result.get("selection_rule") != "argmax_reward_over_valid_candidates_c1_to_c4":
+        return "selection_rule is invalid"
     baseline = candidates_by_index.get(1)
     baseline_id = baseline.get("candidate_id") if baseline else None
     if result.get("baseline_candidate_id") != baseline_id:
         return "Direct Generation does not match C1"
+    candidate_ids = [candidate.get("candidate_id") for candidate in candidates]
+    if any(
+        not isinstance(candidate_id, str) or not candidate_id
+        for candidate_id in candidate_ids
+    ):
+        return "a scored candidate has no candidate identifier"
+    if len(candidate_ids) != len(set(candidate_ids)):
+        return "candidate identifiers are duplicated"
     if candidates:
-        selected = max(
-            candidates,
-            key=lambda row: float(row.get("reward", {}).get("total", 0.0)),
+        try:
+            ordered_candidates = [
+                candidates_by_index[index] for index in sorted(candidates_by_index)
+            ]
+            reward_totals = [
+                _required_candidate_reward(candidate)
+                for candidate in ordered_candidates
+            ]
+        except RuntimeError as exc:
+            return str(exc)
+        selected_index = max(
+            range(len(ordered_candidates)),
+            key=reward_totals.__getitem__,
         )
-        selected_id = selected.get("candidate_id")
+        selected = ordered_candidates[selected_index]
+        selected_id = selected["candidate_id"]
     else:
+        selected = None
         selected_id = None
-    if result.get("stars_candidate_id") != selected_id:
+    stars_candidate_id = result.get("stars_candidate_id")
+    if stars_candidate_id != selected_id:
         return "STARS is not argmax Reward over valid C1-C4 candidates"
+    best_candidate = result.get("best_candidate")
+    if selected is None:
+        if best_candidate is not None:
+            return "best_candidate must be null when no valid candidate exists"
+    elif not isinstance(best_candidate, dict):
+        return "best_candidate is missing for the STARS selection"
+    elif best_candidate.get("candidate_id") != stars_candidate_id:
+        return "best_candidate does not match stars_candidate_id"
+    elif best_candidate != selected:
+        return "best_candidate does not equal the Reward-argmax candidate record"
+    method_status = result.get("method_output_status")
+    if not isinstance(method_status, dict):
+        return "method_output_status is missing"
+    expected_method_status = {
+        "direct_generation_c1": "success" if baseline is not None else "failure",
+        "stars_best_of_4": "success" if selected is not None else "failure",
+    }
+    if method_status != expected_method_status:
+        return "method_output_status does not match candidate availability"
     return ""
+
+
+def _slot_accounting_issue(
+    slot: dict[str, Any],
+    attempts: list[dict[str, Any]],
+    candidate_index: int,
+) -> str:
+    context = f"slot C{candidate_index}"
+    request_count = slot.get("request_count")
+    if (
+        isinstance(request_count, bool)
+        or not isinstance(request_count, int)
+        or request_count != len(attempts)
+    ):
+        return f"{context} request_count does not match its attempts"
+    attempt_seconds: list[float] = []
+    attempt_usages: list[dict[str, int]] = []
+    expected_transport_count = 0
+    for position, attempt in enumerate(attempts, start=1):
+        attempt_context = f"{context} attempt {position}"
+        attempt_seconds.append(
+            _nonnegative_number(
+                attempt.get("request_seconds"),
+                f"{attempt_context}.request_seconds",
+            )
+        )
+        attempt_usage = _usage(attempt.get("usage", {}))
+        attempt_usages.append(attempt_usage)
+        transports = attempt.get("transport_attempts")
+        if not isinstance(transports, list) or not transports:
+            return f"{attempt_context} has no transport attempts"
+        transport_count = attempt.get("transport_request_count")
+        if (
+            isinstance(transport_count, bool)
+            or not isinstance(transport_count, int)
+            or transport_count != len(transports)
+        ):
+            return f"{attempt_context} transport count is inconsistent"
+        expected_transport_count += transport_count
+        transport_seconds = 0.0
+        transport_backoff = 0.0
+        transport_usage = {key: 0 for key in ("input_tokens", "output_tokens", "total_tokens")}
+        for transport_position, transport in enumerate(transports, start=1):
+            if not isinstance(transport, dict):
+                return f"{attempt_context} contains a malformed transport attempt"
+            if transport.get("transport_attempt") != transport_position:
+                return f"{attempt_context} transport attempts are not consecutively numbered"
+            transport_seconds += _nonnegative_number(
+                transport.get("request_seconds"),
+                f"{attempt_context}.transport_request_seconds",
+            )
+            transport_backoff += _nonnegative_number(
+                transport.get("backoff_seconds_after", 0.0),
+                f"{attempt_context}.transport_backoff_seconds",
+            )
+            usage = _usage(transport.get("usage", {}))
+            for key in transport_usage:
+                transport_usage[key] += usage[key]
+        if not _accounting_close(
+            _nonnegative_number(
+                attempt.get("transport_request_seconds"),
+                f"{attempt_context}.transport_request_seconds",
+            ),
+            transport_seconds,
+        ):
+            return f"{attempt_context} transport seconds are inconsistent"
+        if not _accounting_close(
+            _nonnegative_number(
+                attempt.get("transport_backoff_seconds"),
+                f"{attempt_context}.transport_backoff_seconds",
+            ),
+            transport_backoff,
+        ):
+            return f"{attempt_context} transport backoff is inconsistent"
+        if transport_usage != attempt_usage:
+            return f"{attempt_context} token usage is inconsistent"
+        if attempt_seconds[-1] + 5e-6 < transport_seconds + transport_backoff:
+            return f"{attempt_context} request time is shorter than transport time"
+    slot_transport_count = slot.get("transport_request_count")
+    if (
+        isinstance(slot_transport_count, bool)
+        or not isinstance(slot_transport_count, int)
+        or slot_transport_count != expected_transport_count
+    ):
+        return f"{context} transport count does not match its attempts"
+    if not _accounting_close(
+        _nonnegative_number(
+            slot.get("request_seconds"),
+            f"{context}.request_seconds",
+        ),
+        sum(attempt_seconds),
+    ):
+        return f"{context} request seconds do not match its attempts"
+    expected_usage = {
+        key: sum(usage[key] for usage in attempt_usages)
+        for key in ("input_tokens", "output_tokens", "total_tokens")
+    }
+    if _usage(slot.get("usage", {})) != expected_usage:
+        return f"{context} token usage does not match its attempts"
+    return ""
+
+
+def _efficiency_accounting_issue(
+    result: dict[str, Any],
+    slots: list[dict[str, Any]],
+    sampled_frame_count: int,
+) -> str:
+    efficiency = result.get("efficiency")
+    if not isinstance(efficiency, dict):
+        return "efficiency accounting is missing"
+    slot_usages = [_usage(slot.get("usage", {})) for slot in slots]
+    slot_seconds = [
+        _nonnegative_number(
+            slot.get("request_seconds"),
+            f"slot C{index}.request_seconds",
+        )
+        for index, slot in enumerate(slots, start=1)
+    ]
+    slot_requests = [
+        _required_nonnegative_int(
+            slot.get("transport_request_count"),
+            f"slot C{index}.transport_request_count",
+        )
+        for index, slot in enumerate(slots, start=1)
+    ]
+    slot_semantic_attempts = [
+        _required_nonnegative_int(
+            slot.get("request_count"),
+            f"slot C{index}.request_count",
+        )
+        for index, slot in enumerate(slots, start=1)
+    ]
+    total_usage = {
+        key: sum(usage[key] for usage in slot_usages)
+        for key in ("input_tokens", "output_tokens", "total_tokens")
+    }
+    integer_expectations = {
+        "generation_requests": sum(slot_requests),
+        "generation_semantic_attempts": sum(slot_semantic_attempts),
+        "generation_input_tokens": total_usage["input_tokens"],
+        "generation_output_tokens": total_usage["output_tokens"],
+        "generation_total_tokens": total_usage["total_tokens"],
+        "direct_generation_input_tokens": slot_usages[0]["input_tokens"],
+        "direct_generation_output_tokens": slot_usages[0]["output_tokens"],
+        "direct_generation_total_tokens": slot_usages[0]["total_tokens"],
+        "stars_input_tokens": total_usage["input_tokens"],
+        "stars_output_tokens": total_usage["output_tokens"],
+        "stars_total_tokens": total_usage["total_tokens"],
+        "direct_generation_requests": slot_requests[0],
+        "stars_generation_requests": sum(slot_requests),
+        "direct_generation_semantic_attempts": slot_semantic_attempts[0],
+        "stars_semantic_attempts": sum(slot_semantic_attempts),
+        "sampled_frames": sampled_frame_count,
+    }
+    for key, expected in integer_expectations.items():
+        observed = efficiency.get(key)
+        if (
+            isinstance(observed, bool)
+            or not isinstance(observed, int)
+            or observed != expected
+        ):
+            return f"efficiency.{key} is inconsistent with the slot records"
+    for prefix in ("generation", "direct_generation", "stars"):
+        input_tokens = efficiency[f"{prefix}_input_tokens"]
+        output_tokens = efficiency[f"{prefix}_output_tokens"]
+        total_tokens = efficiency[f"{prefix}_total_tokens"]
+        if total_tokens != input_tokens + output_tokens:
+            return f"efficiency.{prefix}_total_tokens is inconsistent"
+    sampling_seconds = _nonnegative_number(
+        efficiency.get("sampling_seconds"),
+        "efficiency.sampling_seconds",
+    )
+    reward_encoding_seconds = _nonnegative_number(
+        efficiency.get("reward_encoding_seconds"),
+        "efficiency.reward_encoding_seconds",
+    )
+    reward_scoring_seconds = _nonnegative_number(
+        efficiency.get("reward_scoring_seconds"),
+        "efficiency.reward_scoring_seconds",
+    )
+    selection_seconds = _nonnegative_number(
+        efficiency.get("selection_seconds"),
+        "efficiency.selection_seconds",
+    )
+    direct_seconds = _nonnegative_number(
+        efficiency.get("direct_generation_seconds"),
+        "efficiency.direct_generation_seconds",
+    )
+    stars_seconds = _nonnegative_number(
+        efficiency.get("stars_seconds"),
+        "efficiency.stars_seconds",
+    )
+    expected_direct_seconds = sampling_seconds + slot_seconds[0]
+    expected_stars_seconds = (
+        sampling_seconds
+        + sum(slot_seconds)
+        + reward_encoding_seconds
+        + reward_scoring_seconds
+        + selection_seconds
+    )
+    if not _accounting_close(direct_seconds, expected_direct_seconds):
+        return "efficiency.direct_generation_seconds is inconsistent"
+    if not _accounting_close(stars_seconds, expected_stars_seconds):
+        return "efficiency.stars_seconds is inconsistent"
+    generation_seconds = _nonnegative_number(
+        efficiency.get("generation_seconds"),
+        "efficiency.generation_seconds",
+    )
+    if generation_seconds + 5e-6 < sum(slot_seconds):
+        return "efficiency.generation_seconds is shorter than request time"
+    metric_seconds = _nonnegative_number(
+        efficiency.get("metric_evaluation_seconds"),
+        "efficiency.metric_evaluation_seconds",
+    )
+    total_pipeline_seconds = _nonnegative_number(
+        efficiency.get("total_pipeline_seconds"),
+        "efficiency.total_pipeline_seconds",
+    )
+    minimum_pipeline_seconds = (
+        sampling_seconds
+        + generation_seconds
+        + reward_encoding_seconds
+        + reward_scoring_seconds
+        + metric_seconds
+        + selection_seconds
+    )
+    if total_pipeline_seconds + 5e-6 < minimum_pipeline_seconds:
+        return "efficiency.total_pipeline_seconds is inconsistent"
+    recorded_slot_seconds = efficiency.get(
+        "slot_generation_seconds_including_retries"
+    )
+    if (
+        not isinstance(recorded_slot_seconds, list)
+        or len(recorded_slot_seconds) != CANDIDATE_SLOTS
+        or any(
+            not _accounting_close(
+                _nonnegative_number(value, "efficiency.slot_generation_seconds"),
+                expected,
+            )
+            for value, expected in zip(recorded_slot_seconds, slot_seconds)
+        )
+    ):
+        return "efficiency slot-generation seconds are inconsistent"
+    recorded_slot_usage = efficiency.get(
+        "slot_generation_usage_including_retries"
+    )
+    if (
+        not isinstance(recorded_slot_usage, list)
+        or len(recorded_slot_usage) != CANDIDATE_SLOTS
+        or [_usage(value) for value in recorded_slot_usage] != slot_usages
+    ):
+        return "efficiency slot-generation usage is inconsistent"
+    scoring_by_slot = efficiency.get("reward_scoring_seconds_by_slot")
+    if (
+        not isinstance(scoring_by_slot, list)
+        or len(scoring_by_slot) != CANDIDATE_SLOTS
+    ):
+        return "efficiency reward-scoring slot accounting is invalid"
+    scoring_values = [
+        _nonnegative_number(value, "efficiency.reward_scoring_seconds_by_slot")
+        for value in scoring_by_slot
+    ]
+    if not _accounting_close(sum(scoring_values), reward_scoring_seconds):
+        return "efficiency reward-scoring seconds are inconsistent"
+    return ""
+
+
+def _nonnegative_number(value: Any, context: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(f"{context} must be numeric.")
+    number = float(value)
+    if not math.isfinite(number) or number < 0.0:
+        raise RuntimeError(f"{context} must be finite and non-negative.")
+    return number
+
+
+def _required_nonnegative_int(value: Any, context: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RuntimeError(f"{context} must be a non-negative integer.")
+    return value
+
+
+def _accounting_close(left: float, right: float) -> bool:
+    return abs(float(left) - float(right)) <= 5e-6
+
+
+def _required_candidate_reward(candidate: dict[str, Any]) -> float:
+    reward = candidate.get("reward")
+    if not isinstance(reward, dict) or "total" not in reward:
+        raise RuntimeError("a scored candidate lacks reward.total")
+    value = reward["total"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError("a scored candidate has a non-numeric reward.total")
+    number = float(value)
+    if not math.isfinite(number):
+        raise RuntimeError("a scored candidate has a non-finite reward.total")
+    if not 0.0 <= number <= 1.0:
+        raise RuntimeError("a scored candidate has reward.total outside [0, 1]")
+    return number
 
 
 def _validate_resume_rows(
     existing_results: dict[str, dict[str, Any]],
     expected_sample_keys: list[str],
     protocol_fingerprint: str,
+    *,
+    generation_checkpoint_identity: dict[str, Any] | None = None,
+    generation_runtime_identity: dict[str, Any] | None = None,
 ) -> None:
     unexpected = sorted(set(existing_results) - set(expected_sample_keys))
     mismatched = sorted(
@@ -1031,10 +1666,23 @@ def _validate_resume_rows(
         for key, row in existing_results.items()
         if row.get("protocol_fingerprint") != protocol_fingerprint
     )
-    if unexpected or mismatched:
+    contract_issues = {
+        key: issue
+        for key, row in existing_results.items()
+        if (
+            issue := _result_contract_issue(
+                row,
+                protocol_fingerprint,
+                generation_checkpoint_identity=generation_checkpoint_identity,
+                generation_runtime_identity=generation_runtime_identity,
+            )
+        )
+    }
+    if unexpected or mismatched or contract_issues:
         raise RuntimeError(
             "Resume rows do not match the requested protocol: "
-            f"unexpected={unexpected[:5]}, mismatched={mismatched[:5]}."
+            f"unexpected={unexpected[:5]}, mismatched={mismatched[:5]}, "
+            f"contract_issues={list(contract_issues.items())[:5]}."
         )
 
 
@@ -1105,15 +1753,14 @@ def _prefix_sums(values: Any) -> list[float]:
 def _usage(raw: Any) -> dict[str, int]:
     if not isinstance(raw, dict):
         raise RuntimeError("Slot usage must be an object.")
-    try:
-        usage = {
-            key: int(raw[key])
-            for key in ("input_tokens", "output_tokens", "total_tokens")
-        }
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError(
-            "Slot usage must include integer input, output, and total tokens."
-        ) from exc
+    usage: dict[str, int] = {}
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise RuntimeError(
+                "Slot usage must include integer input, output, and total tokens."
+            )
+        usage[key] = value
     if any(value < 0 for value in usage.values()):
         raise RuntimeError("Token counts must be non-negative.")
     if usage["total_tokens"] != usage["input_tokens"] + usage["output_tokens"]:
@@ -1123,7 +1770,10 @@ def _usage(raw: Any) -> dict[str, int]:
 
 def _runner_memory() -> dict[str, float]:
     if not torch.cuda.is_available():
-        return {}
+        return {
+            "reward_runner_peak_allocated_mib": 0.0,
+            "reward_runner_peak_reserved_mib": 0.0,
+        }
     return {
         "reward_runner_peak_allocated_mib": round(
             torch.cuda.max_memory_allocated() / 1024**2,

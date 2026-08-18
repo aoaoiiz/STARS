@@ -6,9 +6,9 @@ This repository contains only the main experiment pipeline for LLaVA-Video-7B-Qw
 
 ## Full-data policy
 
-STARS processes every row in each supplied annotation file. The code contains no sample limit, offset, subset sampler, or replacement-sample mechanism. For a full-dataset experiment, each annotation path must therefore point to the complete official annotation manifest. Missing or undecodable videos stop the run instead of reducing the evaluation set.
+STARS processes every row in each supplied annotation file. The code contains no sample limit, offset, subset sampler, or replacement-sample mechanism. For a full-dataset experiment, each annotation path must therefore point to a complete row-level manifest derived from the official annotations, with one row per evaluation item. Nested benchmark records must be flattened without filtering before this step. Missing or undecodable videos stop the run instead of reducing the evaluation set.
 
-Semantic Point Coverage is evaluation-only. The complete annotation manifest must contain a non-empty `semantic_points` field for every row and the required top-level reference-protocol metadata. `scripts/build_semantic_point_manifests.py` creates these fields deterministically from the official question and resolved correct answer without changing the number or order of rows.
+Semantic Point Coverage is evaluation-only. Every row must contain a video identifier, an official question, a resolvable correct answer, and a local video reference or dataset-specific media identifier. The complete annotation manifest must contain a non-empty `semantic_points` field for every row and the required top-level reference-protocol metadata. `scripts/build_semantic_point_manifests.py` creates these fields deterministically from the official question and resolved correct answer without changing the number or order of rows.
 
 ## Repository layout
 
@@ -21,6 +21,8 @@ scripts/
   serve_internvl_openai.py
   serve_llava_video_openai.py
   serve_videollama2_openai.py
+patches/
+  videollama2_clip_eager.patch
 src/creative_video_exp/
 requirements.txt
 requirements-internvl.txt
@@ -28,15 +30,27 @@ requirements-internvl.txt
 
 ## Installation
 
-Use one environment for the experiment runner and reward encoder:
+STARS requires Python 3.10 or later. Use one environment for the experiment runner and reward encoder:
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-The three generation backbones should use separate environments because their upstream repositories may require different dependency versions. Install the official LLaVA-Video and VideoLLaMA2 repositories in their respective environments. For InternVL2.5-8B, install `requirements-internvl.txt` in its service environment. When a VideoLLaMA2 checkout forces FlashAttention2 for the CLIP vision tower, configure that vision tower to use the eager attention backend; the model checkpoint itself is unchanged.
+The three generation backbones should use separate environments because their upstream repositories require different dependency versions. Install [LLaVA-NeXT](https://github.com/LLaVA-VL/LLaVA-NeXT), [InternVL](https://github.com/OpenGVLab/InternVL), and [VideoLLaMA2](https://github.com/DAMO-NLP-SG/VideoLLaMA2) in their respective service environments. Install `requirements-internvl.txt` in the InternVL service environment. In the LLaVA-Video and VideoLLaMA2 environments, install the dependencies specified by the corresponding upstream repository together with the local service dependencies:
+
+```bash
+pip install "fastapi>=0.110" "uvicorn>=0.29" "pydantic>=2.0"
+```
+
+The released VideoLLaMA2 setting uses the eager attention backend for the CLIP vision tower. From a VideoLLaMA2 checkout at base commit `c0bb03abf6b8a6b9a8dccac006fb4db5d4d9e414`, apply the included patch before starting the service:
+
+```bash
+git apply --unidiff-zero /path/to/STARS/patches/videollama2_clip_eager.patch
+```
+
+The VideoLLaMA2 service verifies this source change at startup and refuses to run if the vision tower still forces FlashAttention2. The model checkpoint is not modified.
 
 ## Prepare full annotation manifests
 
@@ -45,11 +59,13 @@ Run the following command once for each complete official annotation file:
 ```bash
 python scripts/build_semantic_point_manifests.py \
   --dataset longvideobench \
-  --input /path/to/full-official-annotations.json \
+  --input /path/to/full-row-level-annotations.json \
   --output /path/to/full-annotations-with-semantic-points.json
 ```
 
 Use `cgbench` and `videomme` for the other datasets. The output contains all source rows.
+
+For Video-MME, store each downloaded video as `<videoID>.mp4` under `VIDEOMME_VIDEO_ROOT`. The loader uses the official `videoID` field for file resolution while retaining the annotation identifier as the sample identifier. HTTP and HTTPS URLs are treated as source metadata, not local paths.
 
 ## Bind model checkpoints
 
@@ -124,7 +140,6 @@ export REWARD_VISION_MODEL_PATH=/path/to/siglip2-so400m-patch14-384
 export REWARD_VISION_CHECKPOINT_MANIFEST=/path/to/siglip2-checkpoint-manifest.json
 export REWARD_VISION_DEVICE=cuda:0
 export REWARD_VISION_DTYPE=bfloat16
-export VLM_TEMPERATURE=0.3
 ```
 
 ## Run the main experiment
@@ -141,6 +156,8 @@ python scripts/run_server_matrix.py \
 
 On a single GPU, start one generation service at a time and run the same command with one model name. Every selected dataset is still evaluated on all rows in its annotation file.
 
+Repeated matrix commands using the same output root merge completed model--dataset rows into the matrix summary. A newly completed row replaces only the prior row with the same dataset and model identifiers.
+
 Use a new output directory when replacing an earlier release. Protocol identifiers and checkpoint manifests are validated before a run can resume.
 
 ## Outputs
@@ -148,6 +165,10 @@ Use a new output directory when replacing an earlier release. Protocol identifie
 Each model-dataset run writes `results.jsonl`, `generation_failures.jsonl`, `run_status.json`, `protocol_manifest.json`, `metrics.json`, `metrics_report.md`, and `candidate_pool_analysis/`. The matrix root also contains `summary.json` and `summary.md`.
 
 The primary reported quantities are Reward, MV-Align, Control Success Rate, Semantic Point Coverage, CIDEr-lite, and repetition rate. Direct Generation is the first candidate. STARS selects the valid candidate with the highest composite Reward among the four requested candidate slots. Metric-wise Best@4 is reported only as a non-deployable upper bound over the same candidate pool.
+
+Semantic Point Coverage is QA-derived in this release. Each official question and resolved correct answer yields two evaluation-only reference points. SPC is the fraction of those points whose maximum cosine similarity to a generated timeline segment reaches `0.50`. CIDEr-lite is a bounded proxy rather than the standard CIDEr implementation: it averages clipped unigram through four-gram F1 overlap against a reference formed by concatenating the annotation caption, official question, resolved answer, the two QA-derived reference points, and category. Neither metric enters generation, Reward, or candidate selection.
+
+Failure-aware effective means retain every requested sample, assigning the documented worst-case value when a method has no valid candidate. Conditional means are also written and are labeled with the corresponding method success rate. Human-readable reports show both estimands separately. Token counts are tokenizer-specific text-token estimates and exclude visual tokens. Accounted online latency for Direct Generation includes frame sampling and the C1 request time. For STARS, it includes frame sampling, all four candidate request times, reward encoding and scoring, and selection. It excludes model loading, response parsing, and evaluation-only metric computation.
 
 ## Data and model licenses
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import io
 import random
 import sys
@@ -24,6 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
+FORMAL_MAX_FRAMES = 16
 
 from creative_video_exp.checkpoint_identity import (
     checkpoint_identity_summary,
@@ -48,6 +50,7 @@ class ChatCompletionRequest(BaseModel):
 
 class InternVLService:
     def __init__(self, model_path: str, max_frames: int, image_size: int):
+        _validate_formal_max_frames(max_frames)
         self.model_path = model_path
         self.max_frames = max_frames
         self.image_size = image_size
@@ -70,7 +73,7 @@ class InternVLService:
             .cuda()
         )
 
-    def generate(self, request: ChatCompletionRequest) -> str:
+    def generate(self, request: ChatCompletionRequest) -> tuple[str, int]:
         prompt_text, frames = _extract_prompt_and_frames(request.messages, self.max_frames)
         if not frames:
             raise HTTPException(status_code=400, detail="No image frames were supplied.")
@@ -110,7 +113,7 @@ class InternVLService:
             )
         if isinstance(response, tuple):
             response = response[0]
-        return str(response).strip()
+        return str(response).strip(), len(frames)
 
 
 def _set_request_seed(seed: int | None) -> None:
@@ -136,6 +139,7 @@ def _extract_prompt_and_frames(
     messages: list[dict[str, Any]],
     max_frames: int,
 ) -> tuple[str, list[Image.Image]]:
+    _validate_formal_max_frames(max_frames)
     text_parts: list[str] = []
     frames: list[Image.Image] = []
     for message in messages:
@@ -152,19 +156,40 @@ def _extract_prompt_and_frames(
                 text_parts.append(str(item.get("text", "")))
             elif item.get("type") == "image_url":
                 image_url = item.get("image_url", {})
-                url = image_url.get("url", "") if isinstance(image_url, dict) else str(image_url)
-                if url.startswith("data:image"):
-                    frames.append(_decode_data_image(url))
-    if max_frames > 0 and len(frames) > max_frames:
-        keep = np.linspace(0, len(frames) - 1, max_frames, dtype=int).tolist()
-        frames = [frames[idx] for idx in keep]
+                raw_url = image_url.get("url", "") if isinstance(image_url, dict) else image_url
+                url = raw_url if isinstance(raw_url, str) else ""
+                if not url.startswith("data:image"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="STARS accepts only data-image frame inputs.",
+                    )
+                if len(frames) >= max_frames:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"STARS accepts at most {FORMAL_MAX_FRAMES} frames per request.",
+                    )
+                frames.append(_decode_data_image(url))
     return "\n".join(part for part in text_parts if part), frames
 
 
+def _validate_formal_max_frames(max_frames: int) -> None:
+    if int(max_frames) != FORMAL_MAX_FRAMES:
+        raise ValueError(
+            f"STARS requires a service frame cap of {FORMAL_MAX_FRAMES}; received {max_frames}."
+        )
+
+
 def _decode_data_image(url: str) -> Image.Image:
-    encoded = url.split(",", 1)[1]
-    data = base64.b64decode(encoded)
-    return Image.open(io.BytesIO(data)).convert("RGB")
+    try:
+        header, encoded = url.split(",", 1)
+        normalized_header = header.lower()
+        if not normalized_header.startswith("data:image/") or ";base64" not in normalized_header:
+            raise ValueError("Invalid data-image header.")
+        data = base64.b64decode(encoded, validate=True)
+        with Image.open(io.BytesIO(data)) as image:
+            return image.convert("RGB")
+    except (ValueError, binascii.Error, OSError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid data-image frame.") from exc
 
 
 def main() -> None:
@@ -178,7 +203,12 @@ def main() -> None:
     )
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8011)
-    parser.add_argument("--max-frames", type=int, default=16)
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        choices=(FORMAL_MAX_FRAMES,),
+        default=FORMAL_MAX_FRAMES,
+    )
     parser.add_argument("--image-size", type=int, default=448)
     parser.add_argument("--api-key", default="")
     args = parser.parse_args()
@@ -216,6 +246,8 @@ def main() -> None:
                     "created": int(time.time()),
                     "owned_by": "local",
                     "checkpoint_identity": checkpoint_identity,
+                    "max_frames": FORMAL_MAX_FRAMES,
+                    "frame_input_policy": "one_to_sixteen_data_images_without_service_resampling",
                 }
             ],
         }
@@ -232,11 +264,11 @@ def main() -> None:
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
         started = time.perf_counter()
-        content = service.generate(request)
+        content, processed_frame_count = service.generate(request)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         latency = time.perf_counter() - started
-        usage, frame_count = _request_usage(
+        usage, requested_frame_count = _request_usage(
             service.tokenizer, request.messages, content
         )
         return {
@@ -254,7 +286,8 @@ def main() -> None:
             "usage": usage,
             "server_metrics": _server_metrics(
                 latency,
-                frame_count,
+                processed_frame_count,
+                requested_frame_count,
                 checkpoint_identity,
             ),
         }
@@ -279,12 +312,10 @@ def _request_usage(tokenizer, messages: list[dict[str, Any]], output: str) -> tu
                     text_parts.append(str(item.get("text", "")))
                 elif item.get("type") == "image_url":
                     frame_count += 1
-    try:
-        input_tokens = len(tokenizer.encode("\n".join(text_parts), add_special_tokens=True))
-        output_tokens = len(tokenizer.encode(output, add_special_tokens=False))
-    except Exception:
-        input_tokens = 0
-        output_tokens = 0
+    input_tokens = len(
+        tokenizer.encode("\n".join(text_parts), add_special_tokens=True)
+    )
+    output_tokens = len(tokenizer.encode(output, add_special_tokens=False))
     return {
         "prompt_tokens": input_tokens,
         "completion_tokens": output_tokens,
@@ -294,13 +325,16 @@ def _request_usage(tokenizer, messages: list[dict[str, Any]], output: str) -> tu
 
 def _server_metrics(
     latency: float,
-    frame_count: int,
+    processed_frame_count: int,
+    requested_frame_count: int,
     checkpoint_identity: dict[str, Any],
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "server_protocol_version": "stars",
         "generation_latency_seconds": round(latency, 6),
-        "visual_input_frames": frame_count,
+        "visual_input_frames": processed_frame_count,
+        "requested_visual_input_frames": requested_frame_count,
+        "configured_max_frames": FORMAL_MAX_FRAMES,
         "token_accounting": "text tokenizer estimate; visual tokens excluded",
         "checkpoint_identity_sha256": checkpoint_identity["identity_sha256"],
         "checkpoint_model_id": checkpoint_identity["model_id"],

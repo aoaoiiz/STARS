@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
@@ -327,6 +328,8 @@ def _ordered_slot_outcomes(
         raise RuntimeError("The candidates field must be a list.")
     candidates_by_index: dict[int, dict[str, Any]] = {}
     for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise RuntimeError("Every scored candidate must be an object.")
         index = int(candidate.get("candidate_index", 0))
         if index in candidates_by_index or not 1 <= index <= pool_size:
             raise RuntimeError("Candidate slot indices must be unique and in C1-C4.")
@@ -350,6 +353,23 @@ def _ordered_slot_outcomes(
         attempts = raw_slot.get("attempts", [])
         if not isinstance(attempts, list) or not attempts:
             raise RuntimeError("Every slot must contain an auditable attempt trace.")
+        if any(not isinstance(attempt, dict) for attempt in attempts):
+            raise RuntimeError("Every generation attempt must be an object.")
+        if "request_seconds" in raw_slot:
+            request_seconds = _required_nonnegative_number(
+                raw_slot,
+                "request_seconds",
+                f"slot C{index}",
+            )
+        else:
+            request_seconds = sum(
+                _required_nonnegative_number(
+                    attempt,
+                    "request_seconds",
+                    f"slot C{index} attempt {position}",
+                )
+                for position, attempt in enumerate(attempts, start=1)
+            )
         usage = _usage(raw_slot.get("usage", {}))
         slot = dict(raw_slot)
         slot.update(
@@ -358,21 +378,15 @@ def _ordered_slot_outcomes(
                 "candidate_id": candidate_id,
                 "terminal_status": status,
                 "candidate": candidate,
-                "request_count": int(
-                    raw_slot.get("request_count", len(attempts))
+                "request_count": _nonnegative_int(
+                    raw_slot.get("request_count", len(attempts)),
+                    f"slot C{index}.request_count",
                 ),
-                "transport_request_count": int(
-                    raw_slot.get("transport_request_count", len(attempts))
+                "transport_request_count": _nonnegative_int(
+                    raw_slot.get("transport_request_count", len(attempts)),
+                    f"slot C{index}.transport_request_count",
                 ),
-                "request_seconds": float(
-                    raw_slot.get(
-                        "request_seconds",
-                        sum(
-                            float(attempt.get("request_seconds", 0.0))
-                            for attempt in attempts
-                        ),
-                    )
-                ),
+                "request_seconds": request_seconds,
                 "usage": usage,
             }
         )
@@ -400,21 +414,34 @@ def _slot_view(slot: dict[str, Any]) -> dict[str, Any]:
 
 
 def _candidate_metrics(candidate: dict[str, Any]) -> dict[str, float]:
-    reward = candidate.get("reward", {})
-    quality = candidate.get("quality", {})
-    semantic_point_coverage = quality.get("semantic_point_coverage")
-    if semantic_point_coverage is None:
-        raise RuntimeError(
-            "Every valid candidate must have semantic-point coverage."
-        )
-    violations = reward.get("violations", reward.get("control_violations", []))
+    reward = _required_mapping(candidate, "reward", "candidate")
+    quality = _required_mapping(candidate, "quality", "candidate")
+    violations = reward.get("violations")
+    if not isinstance(violations, list):
+        raise RuntimeError("candidate.reward.violations must be a list.")
     return {
-        "reward": float(reward.get("total", 0.0)),
-        "mv_align": float(reward.get("alignment", 0.0)),
+        "reward": _required_unit_number(reward, "total", "candidate.reward"),
+        "mv_align": _required_unit_number(
+            reward,
+            "alignment",
+            "candidate.reward",
+        ),
         "csr": float(not violations),
-        "semantic_point_coverage": float(semantic_point_coverage),
-        "cider_lite": float(quality.get("cider_lite", 0.0)),
-        "rep": float(quality.get("repetition_rate", 0.0)),
+        "semantic_point_coverage": _required_unit_number(
+            quality,
+            "semantic_point_coverage",
+            "candidate.quality",
+        ),
+        "cider_lite": _required_unit_number(
+            quality,
+            "cider_lite",
+            "candidate.quality",
+        ),
+        "rep": _required_unit_number(
+            quality,
+            "repetition_rate",
+            "candidate.quality",
+        ),
     }
 
 
@@ -453,15 +480,14 @@ def _method_efficiency(
     slots: list[dict[str, Any]],
     method: str,
 ) -> dict[str, float]:
-    run_efficiency = result.get("efficiency", {})
+    run_efficiency = _required_mapping(result, "efficiency", "result")
     is_stars = method == "stars_best_of_4"
     online_key = "stars_seconds" if is_stars else "direct_generation_seconds"
     return {
-        "online_seconds": float(
-            run_efficiency.get(
-                online_key,
-                sum(float(slot["request_seconds"]) for slot in slots),
-            )
+        "online_seconds": _required_nonnegative_number(
+            run_efficiency,
+            online_key,
+            "result.efficiency",
         ),
         "generation_requests": float(
             sum(int(slot["transport_request_count"]) for slot in slots)
@@ -473,12 +499,20 @@ def _method_efficiency(
             sum(float(slot["request_seconds"]) for slot in slots)
         ),
         "reward_encoding_seconds": float(
-            run_efficiency.get("reward_encoding_seconds", 0.0)
+            _required_nonnegative_number(
+                run_efficiency,
+                "reward_encoding_seconds",
+                "result.efficiency",
+            )
             if is_stars
             else 0.0
         ),
         "reward_scoring_seconds": float(
-            run_efficiency.get("reward_scoring_seconds", 0.0)
+            _required_nonnegative_number(
+                run_efficiency,
+                "reward_scoring_seconds",
+                "result.efficiency",
+            )
             if is_stars
             else 0.0
         ),
@@ -625,7 +659,63 @@ def _cluster_bootstrap_mean_ci(
 
 
 def _reward(candidate: dict[str, Any]) -> float:
-    return float(candidate.get("reward", {}).get("total", 0.0))
+    reward = _required_mapping(candidate, "reward", "candidate")
+    return _required_unit_number(reward, "total", "candidate.reward")
+
+
+def _required_mapping(
+    payload: dict[str, Any],
+    key: str,
+    context: str,
+) -> dict[str, Any]:
+    value = payload.get(key)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{context}.{key} must be an object.")
+    return value
+
+
+def _required_number(
+    payload: dict[str, Any],
+    key: str,
+    context: str,
+) -> float:
+    if key not in payload:
+        raise RuntimeError(f"Missing required field {context}.{key}.")
+    value = payload[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(f"{context}.{key} must be numeric.")
+    number = float(value)
+    if not math.isfinite(number):
+        raise RuntimeError(f"{context}.{key} must be finite.")
+    return number
+
+
+def _required_nonnegative_number(
+    payload: dict[str, Any],
+    key: str,
+    context: str,
+) -> float:
+    number = _required_number(payload, key, context)
+    if number < 0.0:
+        raise RuntimeError(f"{context}.{key} must be non-negative.")
+    return number
+
+
+def _required_unit_number(
+    payload: dict[str, Any],
+    key: str,
+    context: str,
+) -> float:
+    number = _required_number(payload, key, context)
+    if not 0.0 <= number <= 1.0:
+        raise RuntimeError(f"{context}.{key} must be within [0, 1].")
+    return number
+
+
+def _nonnegative_int(value: Any, context: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RuntimeError(f"{context} must be a non-negative integer.")
+    return value
 
 
 def _sample_key(row: dict[str, Any]) -> str:
@@ -638,12 +728,14 @@ def _sample_key(row: dict[str, Any]) -> str:
 def _usage(raw: Any) -> dict[str, int]:
     if not isinstance(raw, dict):
         raise RuntimeError("Slot usage must be an object.")
-    try:
-        usage = {key: int(raw[key]) for key in USAGE_KEYS}
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError(
-            "Slot usage must contain integer input, output, and total tokens."
-        ) from exc
+    usage: dict[str, int] = {}
+    for key in USAGE_KEYS:
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise RuntimeError(
+                "Slot usage must contain integer input, output, and total tokens."
+            )
+        usage[key] = value
     if any(value < 0 for value in usage.values()):
         raise RuntimeError("Token counts must be non-negative.")
     if usage["total_tokens"] != usage["input_tokens"] + usage["output_tokens"]:
@@ -697,7 +789,7 @@ def _write_main_csv(path: Path, summary: dict[str, Any]) -> None:
                 "requested_samples",
                 "successful_samples",
                 "selection_success_rate",
-                "complete_pool_rate",
+                "complete_requested_prefix_rate",
                 *[f"conditional_{metric}" for metric in PAPER_METRICS],
                 *[f"effective_{metric}" for metric in PAPER_METRICS],
             ]
@@ -769,7 +861,20 @@ def _markdown_summary(summary: dict[str, Any]) -> str:
             f"failed slots: **{summary['failed_candidate_slot_count']}**."
         ),
         "",
-        "| Method | Success | Complete pool | Reward | MV-Align | CSR | SPC | CIDEr-lite | Rep |",
+        (
+            "Metric-wise Best@4 Upper Bound selects the best valid C1-C4 "
+            "candidate independently for each metric; its values may come "
+            "from different candidates and do not represent one deployable output."
+        ),
+        "",
+        "## Effective means over all requested samples",
+        "",
+        (
+            "Failed selections contribute 0 to higher-is-better metrics and "
+            "1 to repetition."
+        ),
+        "",
+        "| Method | Success | Complete requested prefix | Reward | MV-Align | CSR | SPC | CIDEr-lite | Rep |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     labels = {
@@ -778,18 +883,96 @@ def _markdown_summary(summary: dict[str, Any]) -> str:
     }
     for method, label in labels.items():
         payload = summary["methods"][method]
-        metrics = payload["conditional_means"]
         lines.append(
-            f"| {label} | {payload['selection_success_rate']:.4f} | "
-            f"{payload['exact_prefix_completion_rate']:.4f} | "
-            f"{_format_optional(metrics['reward'])} | "
-            f"{_format_optional(metrics['mv_align'])} | "
-            f"{_format_optional(metrics['csr'])} | "
-            f"{_format_optional(metrics['semantic_point_coverage'])} | "
-            f"{_format_optional(metrics['cider_lite'])} | "
-            f"{_format_optional(metrics['rep'])} |"
+            _metric_markdown_row(
+                label,
+                payload,
+                payload["effective_means"],
+            )
+        )
+    upper = summary["metric_wise_best_of_4_upper_bound"]
+    lines.append(
+        _metric_markdown_row(
+            "Metric-wise Best@4 Upper Bound",
+            upper,
+            upper["effective_means"],
+        )
+    )
+    lines.extend(
+        [
+            "",
+            "## Conditional means over successful selections only",
+            "",
+            "| Method | Success | Complete requested prefix | Reward | MV-Align | CSR | SPC | CIDEr-lite | Rep |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for method, label in labels.items():
+        payload = summary["methods"][method]
+        lines.append(
+            _metric_markdown_row(
+                label,
+                payload,
+                payload["conditional_means"],
+            )
+        )
+    lines.append(
+        _metric_markdown_row(
+            "Metric-wise Best@4 Upper Bound",
+            upper,
+            upper["conditional_means"],
+        )
+    )
+    lines.extend(
+        [
+            "",
+            "## Mean efficiency over all requested samples",
+            "",
+            "| Method | Accounted online latency (s) | Requests | Input tokens | Output tokens | Total tokens | Reward encoding (s) | Reward scoring (s) |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for method, label in labels.items():
+        efficiency = summary["methods"][method][
+            "efficiency_all_attempted_samples"
+        ]
+        lines.append(
+            f"| {label} | {_efficiency_mean(efficiency, 'online_seconds')} | "
+            f"{_efficiency_mean(efficiency, 'generation_requests')} | "
+            f"{_efficiency_mean(efficiency, 'input_tokens')} | "
+            f"{_efficiency_mean(efficiency, 'output_tokens')} | "
+            f"{_efficiency_mean(efficiency, 'total_tokens')} | "
+            f"{_efficiency_mean(efficiency, 'reward_encoding_seconds')} | "
+            f"{_efficiency_mean(efficiency, 'reward_scoring_seconds')} |"
         )
     return "\n".join(lines) + "\n"
+
+
+def _metric_markdown_row(
+    label: str,
+    payload: dict[str, Any],
+    metrics: dict[str, float | None],
+) -> str:
+    return (
+        f"| {label} | {payload['selection_success_rate']:.4f} | "
+        f"{payload['exact_prefix_completion_rate']:.4f} | "
+        f"{_format_optional(metrics['reward'])} | "
+        f"{_format_optional(metrics['mv_align'])} | "
+        f"{_format_optional(metrics['csr'])} | "
+        f"{_format_optional(metrics['semantic_point_coverage'])} | "
+        f"{_format_optional(metrics['cider_lite'])} | "
+        f"{_format_optional(metrics['rep'])} |"
+    )
+
+
+def _efficiency_mean(payload: dict[str, Any], key: str) -> str:
+    value = _required_mapping(payload, key, "efficiency").get("mean")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(f"efficiency.{key}.mean must be numeric.")
+    number = float(value)
+    if not math.isfinite(number):
+        raise RuntimeError(f"efficiency.{key}.mean must be finite.")
+    return f"{number:.4f}"
 
 
 def _format_optional(value: float | None) -> str:

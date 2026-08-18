@@ -16,6 +16,27 @@ FORMAL_REWARD_WEIGHTS = {
     "control": 4.0 / 17.0,
     "risk": 1.0 / 17.0,
 }
+FORMAL_RISK_TERMS = (
+    "absolute",
+    "guaranteed",
+    "cure",
+    "risk-free",
+    "lowest price",
+    "number one",
+    "best",
+)
+FORMAL_SEMANTIC_POINT_TEXT_FIELDS = (
+    "narration",
+    "on_screen_text",
+    "salient_point",
+)
+FORMAL_VIDEOLLAMA2_BASE_COMMIT = (
+    "c0bb03abf6b8a6b9a8dccac006fb4db5d4d9e414"
+)
+FORMAL_VIDEOLLAMA2_EAGER_PATCH_SHA256 = (
+    "10460ada24dbc70ac3b128cac543a8c206cb9409d8d247dbf93faaf77c063ba9"
+)
+FORMAL_VIDEOLLAMA2_ENCODER_SOURCE = "videollama2/model/encoder.py"
 
 
 @dataclass
@@ -60,7 +81,7 @@ class GenerationConfig:
     candidate_slot_failure_policy: str = "retain_invalid_slot_and_continue"
     method_failure_aggregation: str = "conditional_and_failure_aware_effective"
     salient_points: list[str] = field(default_factory=list)
-    risk_terms: list[str] = field(default_factory=list)
+    risk_terms: list[str] = field(default_factory=lambda: list(FORMAL_RISK_TERMS))
 
 
 @dataclass
@@ -92,6 +113,10 @@ class RewardConfig:
                 "STARS requires the fixed composite reward weights "
                 "6/17, 3/17, 3/17, 4/17, and 1/17."
             )
+        if abs(float(self.visual_grounding_balance) - 0.5) > 1e-12:
+            raise ValueError("STARS requires visual_grounding_balance=0.5.")
+        if abs(float(self.text_anchor_semantic_balance) - 0.7) > 1e-12:
+            raise ValueError("STARS requires text_anchor_semantic_balance=0.7.")
 
 
 @dataclass
@@ -105,6 +130,8 @@ class EvaluationConfig:
     )
 
     def validate(self) -> None:
+        if self.semantic_point_coverage_enabled is not True:
+            raise ValueError("STARS requires Semantic Point Coverage evaluation.")
         if self.semantic_point_reference_policy != "annotation_only":
             raise ValueError(
                 "STARS requires evaluation.semantic_point_reference_policy="
@@ -117,12 +144,11 @@ class EvaluationConfig:
         threshold = float(self.semantic_point_similarity_threshold)
         if abs(threshold - 0.50) > 1e-12:
             raise ValueError("STARS requires an SPC similarity threshold of 0.50.")
-        allowed_fields = {"narration", "on_screen_text", "salient_point"}
         fields = list(dict.fromkeys(self.semantic_point_text_fields))
-        if not fields or any(field not in allowed_fields for field in fields):
+        if fields != list(FORMAL_SEMANTIC_POINT_TEXT_FIELDS):
             raise ValueError(
-                "SPC text fields must be a non-empty subset of narration, "
-                "on_screen_text, and salient_point."
+                "STARS requires SPC text fields narration, on_screen_text, and "
+                "salient_point in that order."
             )
         self.semantic_point_text_fields = fields
 
@@ -150,6 +176,7 @@ class ModelEndpointConfig:
     seed: int = 42
     trust_remote_code: bool = True
     checkpoint_identity: dict[str, Any] = field(default_factory=dict)
+    runtime_identity: dict[str, Any] = field(default_factory=dict)
     checkpoint_manifest_path: str = ""
     notes: str = ""
 
@@ -204,6 +231,8 @@ class ExperimentConfig:
     def validate_main_protocol(self) -> None:
         if self.experiment_version != "stars":
             raise ValueError("experiment_version must be `stars`.")
+        if self.seed != 42:
+            raise ValueError("STARS requires seed=42.")
         if self.sampling.num_bins != 8 or self.sampling.frames_per_bin != 2:
             raise ValueError("STARS requires eight temporal bins and two frames per bin.")
         if self.sampling.max_frames != 16:
@@ -212,6 +241,25 @@ class ExperimentConfig:
             raise ValueError("STARS requires 224-pixel sampled frames.")
         if self.generation.num_candidates != 4:
             raise ValueError("STARS requires four candidates per sample.")
+        generation_values = {
+            "target_duration_sec": 30,
+            "segments": 5,
+            "summary_position": "late",
+            "pace": "medium",
+            "information_density": "medium",
+            "input_protocol": "visual_only",
+            "candidate_generation_protocol": "independent_single_candidate_calls",
+            "parse_retry_count": 7,
+            "pre_score_processing": "json_envelope_and_schema_canonicalization_only",
+            "candidate_slot_failure_policy": "retain_invalid_slot_and_continue",
+            "method_failure_aggregation": "conditional_and_failure_aware_effective",
+        }
+        for field_name, expected in generation_values.items():
+            observed = getattr(self.generation, field_name)
+            if observed != expected:
+                raise ValueError(
+                    f"STARS requires generation.{field_name}={expected!r}."
+                )
         if self.generation.output_language != "English":
             raise ValueError("STARS requires English output.")
         word_bounds = (
@@ -225,6 +273,32 @@ class ExperimentConfig:
             raise ValueError(
                 "STARS requires prompt version "
                 "`stars_visual_only_fixed_validation_retry_v2`."
+            )
+        if self.generation.salient_points:
+            raise ValueError("STARS generation must not receive annotation-derived salient points.")
+        if self.generation.risk_terms != list(FORMAL_RISK_TERMS):
+            raise ValueError("STARS requires the fixed seven-term risk vocabulary.")
+        generation_endpoint = self.models.get(self.models.active_video_model)
+        if generation_endpoint is None:
+            raise ValueError("STARS requires one active video-generation endpoint.")
+        endpoint_values = {
+            "max_frames": 16,
+            "max_new_tokens": 900,
+            "temperature": 0.3,
+            "request_timeout_sec": 300,
+            "retry_count": 2,
+            "seed": 42,
+        }
+        for field_name, expected in endpoint_values.items():
+            observed = getattr(generation_endpoint, field_name)
+            if observed != expected:
+                raise ValueError(
+                    f"STARS requires the active generation endpoint "
+                    f"{field_name}={expected!r}."
+                )
+        if generation_endpoint.id == "videollama2_7b_16f":
+            validate_videollama2_runtime_identity(
+                generation_endpoint.runtime_identity
             )
 
     def as_dict(self) -> dict[str, Any]:
@@ -260,6 +334,41 @@ def _parse_model_suite(payload: dict[str, Any]) -> ModelSuiteConfig:
         active_reward_vision_model=payload.get("active_reward_vision_model", ""),
         endpoints=endpoints,
     )
+
+
+def validate_videollama2_runtime_identity(payload: dict[str, Any]) -> None:
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError("VideoLLaMA2 requires a runtime identity attestation.")
+    if payload.get("required_clip_attention_backend") != "eager":
+        raise ValueError("VideoLLaMA2 must require eager CLIP attention.")
+    if payload.get("loaded_clip_attention_backend") != "eager":
+        raise ValueError("VideoLLaMA2 must load the eager CLIP attention backend.")
+    source = payload.get("encoder_source")
+    if source != FORMAL_VIDEOLLAMA2_ENCODER_SOURCE:
+        raise ValueError("VideoLLaMA2 encoder source attestation is invalid.")
+    commit = payload.get("repository_commit")
+    if commit != FORMAL_VIDEOLLAMA2_BASE_COMMIT:
+        raise ValueError("VideoLLaMA2 repository commit attestation is invalid.")
+    for key in (
+        "repository_diff_sha256",
+        "base_encoder_source_sha256",
+        "encoder_source_sha256",
+        "expected_encoder_source_sha256",
+        "eager_patch_sha256",
+    ):
+        value = payload.get(key)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(f"VideoLLaMA2 {key} attestation is invalid.")
+    if payload.get("repository_diff_present") is not True:
+        raise ValueError("VideoLLaMA2 repository diff attestation is invalid.")
+    if payload.get("exact_eager_patch_verified") is not True:
+        raise ValueError("VideoLLaMA2 exact eager patch was not verified.")
+    if payload.get("eager_patch_sha256") != FORMAL_VIDEOLLAMA2_EAGER_PATCH_SHA256:
+        raise ValueError("VideoLLaMA2 eager patch fingerprint is invalid.")
+    if payload.get("encoder_source_sha256") != payload.get(
+        "expected_encoder_source_sha256"
+    ):
+        raise ValueError("VideoLLaMA2 encoder source differs from the expected patch.")
 
 
 def _expand_env_values(value: Any) -> Any:
