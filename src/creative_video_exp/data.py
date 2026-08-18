@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -19,9 +20,10 @@ class VideoSample:
     answer: str = ""
     category: str = ""
     duration: float | None = None
-    selling_points: list[str] = field(default_factory=list)
+    semantic_points: list[str] = field(default_factory=list)
+    semantic_point_source_field: str = ""
     target_audience: str = ""
-    cta: str = ""
+    closing_summary: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -31,7 +33,6 @@ class VideoSample:
             self.question,
             self.answer,
             self.category,
-            " ".join(self.selling_points),
             self.target_audience,
         ]
         return " ".join(part for part in parts if part)
@@ -42,18 +43,21 @@ class VideoSample:
             self.caption,
             self.question,
             self.answer,
-            " ".join(self.selling_points),
+            " ".join(self.semantic_points),
             self.category,
         ]
         return " ".join(part for part in parts if part)
 
 
 def load_samples(config: DataConfig, project_root: str | Path | None = None) -> list[VideoSample]:
-    rows = _slice_rows(_load_rows(config, project_root), config.offset, config.limit)
+    rows = _load_rows(config, project_root)
     samples = [_row_to_sample(row, config, project_root) for row in rows]
-    samples = [sample for sample in samples if sample.video_id]
     if not samples:
-        raise RuntimeError("No samples were loaded. Check annotation_path, hf_dataset, or limit.")
+        raise RuntimeError("No samples were loaded. Check annotation_path or hf_dataset.")
+    missing_ids = [index for index, sample in enumerate(samples) if not sample.video_id]
+    if missing_ids:
+        preview = ", ".join(str(index) for index in missing_ids[:10])
+        raise RuntimeError(f"Annotation rows without a video id: {preview}.")
     return samples
 
 
@@ -137,14 +141,17 @@ def _row_to_sample(row: dict[str, Any], config: DataConfig, project_root: str | 
         if part
     )
     question = _format_question(row)
+    choices = _choice_values(row)
     answer = normalize_text(_first(row, "answer", "gt_answer", "label", "golden_answer", "correct_answer"))
-    answer = _expand_choice_answer(answer, _first(row, "choices", "candidates", "options"))
+    answer = _expand_choice_answer(answer, choices)
     if not answer:
         answer = _derive_answer_from_choices(row)
     category = normalize_text(
         _first(
             row,
             "category",
+            "question_category",
+            "topic_category",
             "domain",
             "sub_category",
             "subfield",
@@ -156,16 +163,26 @@ def _row_to_sample(row: dict[str, Any], config: DataConfig, project_root: str | 
     duration = _safe_float(
         _first(row, "duration", "duration_sec", "video_duration", "length", "duration_seconds")
     )
-    selling_points = as_list(
-        _first(row, "selling_points", "selling_point", "product_points", "highlights", "clues", "clue")
+    semantic_point_source_field, semantic_point_payload = _first_with_key(
+        row,
+        "semantic_points",
+        "semantic_point",
+        "expected_semantic_points",
+        "evidence_points",
+        "key_points",
+        "key_information",
+        "highlights",
+        "clues",
+        "clue",
+        "salient_points",
+        "salient_point",
+        "selling_points",
+        "selling_point",
+        "product_points",
     )
+    semantic_points = as_list(semantic_point_payload)
     target_audience = normalize_text(_first(row, "target_audience", "audience", "user_group"))
-    cta = normalize_text(_first(row, "cta", "call_to_action"))
-
-    if not selling_points:
-        selling_points = _derive_points(caption, category)
-    if not cta:
-        cta = "点击了解更多"
+    closing_summary = normalize_text(_first(row, "closing_summary", "closing", "conclusion"))
 
     return VideoSample(
         video_id=normalize_text(video_id),
@@ -175,18 +192,12 @@ def _row_to_sample(row: dict[str, Any], config: DataConfig, project_root: str | 
         answer=answer,
         category=category,
         duration=duration,
-        selling_points=selling_points,
+        semantic_points=semantic_points,
+        semantic_point_source_field=semantic_point_source_field,
         target_audience=target_audience,
-        cta=cta,
+        closing_summary=closing_summary,
         raw=row,
     )
-
-
-def _slice_rows(rows: list[dict[str, Any]], offset: int, limit: int) -> list[dict[str, Any]]:
-    start = max(0, int(offset or 0))
-    if limit and limit > 0:
-        return rows[start : start + int(limit)]
-    return rows[start:]
 
 
 def _first(row: dict[str, Any], *keys: str) -> Any:
@@ -196,17 +207,24 @@ def _first(row: dict[str, Any], *keys: str) -> Any:
     return ""
 
 
+def _first_with_key(row: dict[str, Any], *keys: str) -> tuple[str, Any]:
+    for key in keys:
+        if key in row and row[key] not in (None, ""):
+            return key, row[key]
+    return "", ""
+
+
 def _format_question(row: dict[str, Any]) -> str:
     question = normalize_text(_first(row, "question", "query", "problem"))
-    options = _first(row, "options", "candidates", "choices")
+    options = _choice_values(row)
     option_text = _format_options(options)
     if option_text and question:
-        return f"{question} 选项: {option_text}"
+        return f"{question} Options: {option_text}"
     return question
 
 
 def _derive_answer_from_choices(row: dict[str, Any]) -> str:
-    choices = _first(row, "choices", "candidates", "options")
+    choices = _choice_values(row)
     if not isinstance(choices, (dict, list)) or not choices:
         return ""
     correct = _first(
@@ -227,26 +245,70 @@ def _derive_answer_from_choices(row: dict[str, Any]) -> str:
     return ""
 
 
+def _choice_values(row: dict[str, Any]) -> Any:
+    choices = _first(row, "choices", "candidates", "options")
+    if isinstance(choices, (dict, list)) and choices:
+        return choices
+    indexed = []
+    for idx in range(26):
+        key = f"option{idx}"
+        if key not in row:
+            break
+        value = row.get(key)
+        if value not in (None, ""):
+            indexed.append(value)
+    return indexed
+
+
 def _expand_choice_answer(answer: str, choices: Any) -> str:
     if not answer or not isinstance(choices, (dict, list)):
         return answer
+    selector_label = (
+        answer.strip().upper()
+        if isinstance(answer, str)
+        and len(answer.strip()) == 1
+        and answer.strip().isalpha()
+        else ""
+    )
     if isinstance(choices, dict):
         if answer in choices:
-            return normalize_text(choices[answer])
+            return _strip_matching_choice_label(
+                normalize_text(choices[answer]), selector_label
+            )
         upper = answer.upper()
         if upper in choices:
-            return normalize_text(choices[upper])
+            return _strip_matching_choice_label(
+                normalize_text(choices[upper]), upper
+            )
         return answer
-    if isinstance(answer, str) and len(answer) == 1 and answer.isalpha():
-        index = ord(answer.upper()) - ord("A")
+    if selector_label:
+        index = ord(selector_label) - ord("A")
     else:
         try:
             index = int(answer)
         except (TypeError, ValueError):
             return answer
     if 0 <= index < len(choices):
-        return normalize_text(choices[index])
+        return _strip_matching_choice_label(
+            normalize_text(choices[index]), selector_label
+        )
     return answer
+
+
+def _strip_matching_choice_label(text: str, selector_label: str) -> str:
+    text = normalize_text(text)
+    if not text or not selector_label:
+        return text
+    label = re.escape(selector_label.upper())
+    patterns = (
+        rf"^\s*{label}\s*[.):\-]\s+",
+        rf"^\s*[([]\s*{label}\s*[)\]]\s*[.):\-]?\s*",
+    )
+    for pattern in patterns:
+        cleaned, count = re.subn(pattern, "", text, count=1, flags=re.IGNORECASE)
+        if count and cleaned.strip():
+            return normalize_text(cleaned)
+    return text
 
 
 def _format_options(options: Any) -> str:
@@ -344,14 +406,3 @@ def _guess_video_path(roots: list[Path], video_id: str, search_dirs: list[str]) 
                 if candidate_dir.exists():
                     return str(candidate_dir)
     return ""
-
-
-def _derive_points(caption: str, category: str) -> list[str]:
-    caption = caption or ""
-    if "咖啡" in caption or category == "food":
-        return ["风味层次", "真实场景", "轻松下单"]
-    if "鞋" in caption or category == "sports":
-        return ["舒适体验", "稳定表现", "日常适用"]
-    if "灯" in caption or category == "home":
-        return ["使用舒适", "空间友好", "细节设计"]
-    return ["核心卖点", "使用场景", "信任背书"]

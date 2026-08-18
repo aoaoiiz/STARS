@@ -1,14 +1,16 @@
-"""Sparse creative video experiment package."""
-
 __all__ = [
     "config",
+    "checkpoint_identity",
     "data",
+    "failure_aware_postprocessing",
     "generation",
     "metrics",
     "modeling",
+    "provenance",
     "reporting",
     "representations",
     "reward",
+    "semantic_points",
     "text_metrics",
     "video",
 ]

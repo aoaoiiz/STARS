@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import math
+import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,6 +14,16 @@ from .representations import VideoRepresentation, script_video_alignment
 from .utils import clip01
 
 
+CONTROL_CATEGORIES = (
+    "segment_count",
+    "timestamp_validity",
+    "duration_coverage",
+    "required_fields",
+    "summary_position",
+    "information_density",
+)
+
+
 @dataclass
 class RewardBreakdown:
     total: float
@@ -19,9 +32,8 @@ class RewardBreakdown:
     rhythm: float
     control: float
     risk: float
-    text_reasoning: float
-    text_reasoning_rationale: str
     violations: list[str]
+    risk_terms_detected: list[str]
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -31,9 +43,9 @@ class RewardBreakdown:
             "rhythm": round(self.rhythm, 6),
             "control": round(self.control, 6),
             "risk": round(self.risk, 6),
-            "text_reasoning": round(self.text_reasoning, 6),
-            "text_reasoning_rationale": self.text_reasoning_rationale,
+            "control_violations": self.violations,
             "violations": self.violations,
+            "risk_terms_detected": self.risk_terms_detected,
         }
 
 
@@ -42,11 +54,10 @@ class SelfRewardScorer:
         self,
         reward_config: RewardConfig,
         generation_config: GenerationConfig,
-        text_reward_model: Any | None = None,
     ):
         self.reward_config = reward_config
         self.generation_config = generation_config
-        self.text_reward_model = text_reward_model
+        self.reward_config.validate_formal_protocol()
 
     def score(
         self,
@@ -54,43 +65,27 @@ class SelfRewardScorer:
         representation: VideoRepresentation,
     ) -> RewardBreakdown:
         violations = validate_candidate(candidate, self.generation_config)
-        alignment = script_video_alignment(candidate.text, representation)
-        readability = _readability_score(candidate)
+        alignment = script_video_alignment(
+            _alignment_text(candidate),
+            representation,
+            visual_grounding_balance=self.reward_config.visual_grounding_balance,
+            text_anchor_semantic_balance=self.reward_config.text_anchor_semantic_balance,
+        )
+        readability = _readability_score(candidate, self.generation_config)
         rhythm = _rhythm_score(candidate, self.generation_config)
-        control = clip01(1.0 - len(violations) / 5.0)
-        risk = _risk_score(candidate.text, self.generation_config.risk_terms)
-        text_reasoning_result = (
-            self.text_reward_model.score(candidate)
-            if self.text_reward_model is not None
-            else None
+        control = clip01(1.0 - len(set(violations)) / len(CONTROL_CATEGORIES))
+        risk_terms_detected = _detected_risk_terms(
+            _all_script_text(candidate),
+            self.generation_config.risk_terms,
         )
-        text_reasoning = (
-            clip01(text_reasoning_result.score)
-            if text_reasoning_result is not None
-            else 0.0
-        )
-        text_reasoning_rationale = (
-            text_reasoning_result.rationale
-            if text_reasoning_result is not None
-            else ""
-        )
-        weighted_total = (
+        risk = _risk_score(risk_terms_detected, self.generation_config.risk_terms)
+        total = (
             self.reward_config.alignment_weight * alignment
             + self.reward_config.readability_weight * readability
             + self.reward_config.rhythm_weight * rhythm
             + self.reward_config.control_weight * control
             + self.reward_config.risk_weight * risk
-            + self.reward_config.text_reasoning_weight * text_reasoning
         )
-        weight_sum = (
-            self.reward_config.alignment_weight
-            + self.reward_config.readability_weight
-            + self.reward_config.rhythm_weight
-            + self.reward_config.control_weight
-            + self.reward_config.risk_weight
-            + self.reward_config.text_reasoning_weight
-        )
-        total = weighted_total / max(1e-8, weight_sum)
         return RewardBreakdown(
             total=clip01(total),
             alignment=clip01(alignment),
@@ -98,9 +93,8 @@ class SelfRewardScorer:
             rhythm=clip01(rhythm),
             control=clip01(control),
             risk=clip01(risk),
-            text_reasoning=clip01(text_reasoning),
-            text_reasoning_rationale=text_reasoning_rationale,
             violations=violations,
+            risk_terms_detected=risk_terms_detected,
         )
 
 
@@ -112,96 +106,85 @@ def validate_candidate(
     if len(candidate.timeline) != config.segments:
         violations.append("segment_count")
 
-    duration = candidate.timeline[-1].end - candidate.timeline[0].start if candidate.timeline else 0.0
-    if config.target_duration_sec > 0:
-        rel_error = abs(duration - config.target_duration_sec) / config.target_duration_sec
-        if rel_error > 0.15:
-            violations.append("duration")
+    if not _timestamps_valid(candidate):
+        violations.append("timestamp_validity")
+    if not _duration_coverage_ok(candidate, config):
+        violations.append("duration_coverage")
+    if not _required_fields_present(candidate):
+        violations.append("required_fields")
 
-    cta_indices = [
-        idx for idx, segment in enumerate(candidate.timeline) if "cta" in segment.control_tags
+    summary_indices = [
+        idx for idx, segment in enumerate(candidate.timeline) if "summary" in segment.control_tags
     ]
-    expected = _expected_cta_index(len(candidate.timeline), config.cta_position)
-    if not cta_indices or abs(cta_indices[-1] - expected) > 1:
-        violations.append("cta_position")
+    expected = _expected_summary_index(config.segments, config.summary_position)
+    if len(summary_indices) != 1 or summary_indices[0] != expected:
+        violations.append("summary_position")
 
-    expected_points = candidate.controls.get("selling_points") or config.selling_points
-    if not _selling_order_ok(candidate, expected_points):
-        violations.append("selling_point_order")
-
-    risk_hits = [term for term in config.risk_terms if term and term in candidate.text]
-    if risk_hits:
-        violations.append("risk_terms:" + ",".join(risk_hits))
-
-    density = _mean_segment_chars(candidate)
-    if config.information_density == "low" and density > 34:
+    density = _mean_segment_words(candidate)
+    if config.information_density == "low" and density > config.target_words_per_segment:
         violations.append("information_density")
-    if config.information_density == "medium" and not (18 <= density <= 56):
+    if config.information_density == "medium" and not (
+        config.min_words_per_segment <= density <= config.max_words_per_segment
+    ):
         violations.append("information_density")
-    if config.information_density == "high" and density < 32:
+    if config.information_density == "high" and density < config.target_words_per_segment:
         violations.append("information_density")
     return violations
 
 
-def build_preference_pairs(
-    sample_id: str,
-    candidate_rows: list[dict[str, Any]],
-    margin: float,
-) -> list[dict[str, Any]]:
-    pairs = []
-    sorted_rows = sorted(candidate_rows, key=lambda row: row["reward"]["total"], reverse=True)
-    for left_idx, chosen in enumerate(sorted_rows):
-        for rejected in sorted_rows[left_idx + 1 :]:
-            diff = chosen["reward"]["total"] - rejected["reward"]["total"]
-            if diff >= margin:
-                pairs.append(
-                    {
-                        "video_id": sample_id,
-                        "chosen_id": chosen["candidate_id"],
-                        "rejected_id": rejected["candidate_id"],
-                        "chosen_score": chosen["reward"]["total"],
-                        "rejected_score": rejected["reward"]["total"],
-                        "margin": round(diff, 6),
-                        "chosen_text": chosen["text"],
-                        "rejected_text": rejected["text"],
-                    }
-                )
-    return pairs
-
-
-def _readability_score(candidate: ScriptCandidate) -> float:
-    lengths = np.asarray([len(segment.narration) for segment in candidate.timeline], dtype=np.float32)
+def _readability_score(candidate: ScriptCandidate, config: GenerationConfig) -> float:
+    lengths = np.asarray(
+        [_english_word_count(segment.narration) for segment in candidate.timeline],
+        dtype=np.float32,
+    )
     if len(lengths) == 0:
         return 0.0
-    target = 34.0
-    length_score = 1.0 - float(np.mean(np.abs(lengths - target)) / target)
-    variance_penalty = min(0.35, float(np.std(lengths) / max(1.0, target)))
-    punctuation_bonus = 0.08 if any(mark in candidate.text for mark in "，。！？") else 0.0
-    return clip01(length_score - variance_penalty + punctuation_bonus)
+    target = float(max(1, config.target_words_per_segment))
+    closeness = 1.0 - float(np.mean(np.minimum(1.0, np.abs(lengths - target) / target)))
+    within_range = float(
+        np.mean(
+            (lengths >= config.min_words_per_segment)
+            & (lengths <= config.max_words_per_segment)
+        )
+    )
+    sentence_completion = float(
+        np.mean(
+            [
+                1.0 if re.search(r"[.!?][\"']?$", segment.narration.strip()) else 0.0
+                for segment in candidate.timeline
+            ]
+        )
+    )
+    return clip01(0.60 * closeness + 0.25 * within_range + 0.15 * sentence_completion)
 
 
 def _rhythm_score(candidate: ScriptCandidate, config: GenerationConfig) -> float:
-    durations = np.asarray(
-        [segment.end - segment.start for segment in candidate.timeline],
-        dtype=np.float32,
-    )
-    if len(durations) == 0:
+    if not candidate.timeline or config.segments <= 0 or config.target_duration_sec <= 0:
         return 0.0
-    target = config.target_duration_sec / max(1, config.segments)
-    evenness = 1.0 - float(np.std(durations) / max(1.0, target))
-    pace_target = {"slow": 7.5, "medium": 6.0, "fast": 4.5}.get(config.pace, 6.0)
-    pace_score = 1.0 - abs(float(durations.mean()) - pace_target) / max(1.0, pace_target)
-    return clip01(0.55 * evenness + 0.45 * pace_score)
+    target_duration = float(config.target_duration_sec)
+    target = np.full(config.segments, target_duration / config.segments, dtype=np.float64)
+    observed = np.zeros(config.segments, dtype=np.float64)
+    for index, segment in enumerate(candidate.timeline[: config.segments]):
+        if _finite_number(segment.start) and _finite_number(segment.end):
+            observed[index] = max(0.0, float(segment.end) - float(segment.start))
+    profile_error = float(np.sum(np.abs(observed - target)) / (2.0 * target_duration))
+    profile_score = clip01(1.0 - profile_error)
+    observed_boundaries = np.cumsum(observed)
+    target_boundaries = np.cumsum(target)
+    boundary_error = float(np.mean(np.abs(observed_boundaries - target_boundaries)) / target_duration)
+    boundary_score = clip01(1.0 - 2.0 * boundary_error)
+    extra_segment_penalty = max(0, len(candidate.timeline) - config.segments) / max(1, config.segments)
+    return clip01(0.55 * profile_score + 0.45 * boundary_score - extra_segment_penalty)
 
 
-def _risk_score(text: str, risk_terms: list[str]) -> float:
+def _risk_score(detected_terms: list[str], risk_terms: list[str]) -> float:
     if not risk_terms:
         return 1.0
-    hits = sum(1 for term in risk_terms if term and term in text)
-    return clip01(1.0 - hits / max(1, len(risk_terms)))
+    configured = {term.lower() for term in risk_terms if term}
+    return clip01(1.0 - len(set(detected_terms)) / max(1, len(configured)))
 
 
-def _expected_cta_index(segment_count: int, position: str) -> int:
+def _expected_summary_index(segment_count: int, position: str) -> int:
     if segment_count <= 0:
         return 0
     if position == "early":
@@ -211,20 +194,98 @@ def _expected_cta_index(segment_count: int, position: str) -> int:
     return segment_count - 1
 
 
-def _selling_order_ok(candidate: ScriptCandidate, expected_points: list[str]) -> bool:
-    expected = [point for point in expected_points if point]
-    if len(expected) < 2:
-        return True
-    text = candidate.text
-    positions = []
-    for point in expected[: min(3, len(expected))]:
-        position = text.find(point)
-        if position >= 0:
-            positions.append(position)
-    return len(positions) < 2 or positions == sorted(positions)
-
-
-def _mean_segment_chars(candidate: ScriptCandidate) -> float:
+def _mean_segment_words(candidate: ScriptCandidate) -> float:
     if not candidate.timeline:
         return 0.0
-    return float(np.mean([len(segment.narration) for segment in candidate.timeline]))
+    return float(np.mean([_english_word_count(segment.narration) for segment in candidate.timeline]))
+
+
+def _english_word_count(text: str) -> int:
+    normalized = unicodedata.normalize("NFKD", text or "")
+    latin_text = "".join(
+        character for character in normalized if not unicodedata.combining(character)
+    )
+    return len(re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)?", latin_text))
+
+
+def _finite_number(value: float | None) -> bool:
+    return value is not None and math.isfinite(float(value))
+
+
+def _timestamps_valid(candidate: ScriptCandidate) -> bool:
+    if not candidate.timeline:
+        return False
+    previous_end: float | None = None
+    for segment in candidate.timeline:
+        if not _finite_number(segment.start) or not _finite_number(segment.end):
+            return False
+        start = float(segment.start)
+        end = float(segment.end)
+        if start < 0.0 or end <= start:
+            return False
+        if previous_end is not None and start < previous_end - 1e-6:
+            return False
+        previous_end = end
+    return True
+
+
+def _duration_coverage_ok(candidate: ScriptCandidate, config: GenerationConfig) -> bool:
+    if not _timestamps_valid(candidate) or config.target_duration_sec <= 0:
+        return False
+    target = float(config.target_duration_sec)
+    first_start = float(candidate.timeline[0].start)
+    last_end = float(candidate.timeline[-1].end)
+    boundary_tolerance = max(0.5, 0.05 * target)
+    if abs(first_start) > boundary_tolerance:
+        return False
+    if abs(last_end - target) / target > 0.15:
+        return False
+    gaps = 0.0
+    for left, right in zip(candidate.timeline, candidate.timeline[1:]):
+        gaps += max(0.0, float(right.start) - float(left.end))
+    return gaps / target <= 0.15
+
+
+def _required_fields_present(candidate: ScriptCandidate) -> bool:
+    if not candidate.timeline:
+        return False
+    if candidate.missing_required_fields:
+        return False
+    return all(bool(segment.narration.strip()) for segment in candidate.timeline)
+
+
+def _all_script_text(candidate: ScriptCandidate) -> str:
+    fields: list[str] = [candidate.text]
+    for segment in candidate.timeline:
+        fields.extend(
+            [
+                segment.narration,
+                segment.on_screen_text,
+                segment.salient_point,
+                " ".join(segment.control_tags),
+            ]
+        )
+    return "\n".join(field for field in fields if field)
+
+
+def _alignment_text(candidate: ScriptCandidate) -> str:
+    fields: list[str] = []
+    for segment in candidate.timeline:
+        fields.extend(
+            [
+                segment.narration,
+                segment.on_screen_text,
+                segment.salient_point,
+            ]
+        )
+    return "\n".join(field for field in fields if field)
+
+
+def _detected_risk_terms(text: str, risk_terms: list[str]) -> list[str]:
+    text_lower = text.lower()
+    hits: list[str] = []
+    for term in risk_terms:
+        normalized = term.strip().lower()
+        if normalized and normalized in text_lower and normalized not in hits:
+            hits.append(normalized)
+    return hits
