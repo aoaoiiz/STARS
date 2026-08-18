@@ -1,106 +1,195 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 
 
-def summarize_results(results: list[dict[str, Any]], preference_pairs: list[dict[str, Any]]) -> dict[str, Any]:
+PAPER_METRICS = (
+    "reward",
+    "mv_align",
+    "csr",
+    "semantic_point_coverage",
+    "cider_lite",
+    "rep",
+)
+
+
+def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     candidate_rows = [
         candidate
         for result in results
         for candidate in result.get("candidates", [])
     ]
-    best_rows = [result["best_candidate"] for result in results if result.get("best_candidate")]
-    if not candidate_rows:
-        return {"num_samples": 0, "num_candidates": 0}
-
-    all_violations = [candidate["reward"]["violations"] for candidate in candidate_rows]
-    best_violations = [candidate["reward"]["violations"] for candidate in best_rows]
-    return {
+    selected_rows = [
+        result["best_candidate"]
+        for result in results
+        if result.get("best_candidate") is not None
+    ]
+    selected_metrics = [_candidate_metrics(row) for row in selected_rows]
+    summary: dict[str, Any] = {
         "num_samples": len(results),
         "num_candidates": len(candidate_rows),
-        "preference_pairs": len(preference_pairs),
+        "selected_output_success_count": len(selected_rows),
+        "selected_output_success_rate": round(
+            len(selected_rows) / max(1, len(results)),
+            6,
+        ),
+        "real_video_rate": _mean(
+            float(result.get("sampling", {}).get("source_kind") != "synthetic")
+            for result in results
+        ),
+        "multimodal_generation_rate": _mean(
+            float(result.get("generation_source") == "multimodal_model")
+            for result in results
+        ),
         "source_kind_counts": _counts(
-            result.get("sampling", {}).get("source_kind", "unknown") for result in results
+            result.get("sampling", {}).get("source_kind", "unknown")
+            for result in results
         ),
         "generation_source_counts": _counts(
             result.get("generation_source", "unknown") for result in results
         ),
-        "multimodal_generation_rate": _generation_rate(results, "multimodal_model"),
-        "control_success_rate_all": _success_rate(all_violations),
-        "control_success_rate_best": _success_rate(best_violations),
-        "constraint_violation_rate_all": 1.0 - _success_rate(all_violations),
-        "constraint_violation_rate_best": 1.0 - _success_rate(best_violations),
-        "mean_candidate_reward": _mean(candidate["reward"]["total"] for candidate in candidate_rows),
-        "mean_best_reward": _mean(candidate["reward"]["total"] for candidate in best_rows),
-        "mean_alignment": _mean(candidate["reward"]["alignment"] for candidate in candidate_rows),
-        "mean_best_alignment": _mean(candidate["reward"]["alignment"] for candidate in best_rows),
-        "mean_readability": _mean(candidate["reward"]["readability"] for candidate in candidate_rows),
-        "mean_rhythm": _mean(candidate["reward"]["rhythm"] for candidate in candidate_rows),
-        "mean_text_reasoning": _mean(
-            candidate["reward"].get("text_reasoning", 0.0) for candidate in candidate_rows
+        "selected_metrics": {
+            metric: _optional_mean(
+                row.get(metric) for row in selected_metrics
+            )
+            for metric in PAPER_METRICS
+        },
+    }
+    summary.update(_efficiency_summary(results))
+    summary.update(_candidate_pool_integrity_summary(results))
+    return summary
+
+
+def _candidate_metrics(candidate: dict[str, Any]) -> dict[str, float | None]:
+    reward = candidate.get("reward", {})
+    quality = candidate.get("quality", {})
+    violations = reward.get("violations", reward.get("control_violations", []))
+    return {
+        "reward": float(reward.get("total", 0.0)),
+        "mv_align": float(reward.get("alignment", 0.0)),
+        "csr": float(not violations),
+        "semantic_point_coverage": _optional_float(
+            quality.get("semantic_point_coverage")
         ),
-        "real_video_rate": _real_video_rate(results),
-        "mean_bleu_1": _quality_mean(candidate_rows, "bleu_1"),
-        "mean_bleu_2": _quality_mean(candidate_rows, "bleu_2"),
-        "mean_bleu_4": _quality_mean(candidate_rows, "bleu_4"),
-        "mean_rouge_l": _quality_mean(candidate_rows, "rouge_l"),
-        "mean_meteor": _quality_mean(candidate_rows, "meteor"),
-        "mean_cider_lite": _quality_mean(candidate_rows, "cider_lite"),
-        "mean_distinct_1": _quality_mean(candidate_rows, "distinct_1"),
-        "mean_distinct_2": _quality_mean(candidate_rows, "distinct_2"),
-        "mean_repetition_rate": _quality_mean(candidate_rows, "repetition_rate"),
-        "mean_length_tokens": _quality_mean(candidate_rows, "length_tokens"),
-        "mean_reference_token_coverage": _quality_mean(candidate_rows, "reference_token_coverage"),
-        "answer_hit_rate": _quality_mean(candidate_rows, "answer_hit"),
-        "selling_point_coverage": _quality_mean(candidate_rows, "selling_point_coverage"),
-        "best_mean_bleu_4": _quality_mean(best_rows, "bleu_4"),
-        "best_mean_rouge_l": _quality_mean(best_rows, "rouge_l"),
-        "best_mean_meteor": _quality_mean(best_rows, "meteor"),
-        "best_mean_cider_lite": _quality_mean(best_rows, "cider_lite"),
+        "cider_lite": float(quality.get("cider_lite", 0.0)),
+        "rep": float(quality.get("repetition_rate", 0.0)),
     }
 
 
-def _success_rate(violation_lists: list[list[str]]) -> float:
-    if not violation_lists:
-        return 0.0
-    return float(np.mean([1.0 if not violations else 0.0 for violations in violation_lists]))
-
-
-def _mean(values) -> float:
-    values = list(values)
-    if not values:
-        return 0.0
-    return round(float(np.mean(values)), 6)
-
-
-def _quality_mean(rows: list[dict[str, Any]], key: str) -> float:
-    return _mean(row.get("quality", {}).get(key, 0.0) for row in rows)
-
-
-def _real_video_rate(results: list[dict[str, Any]]) -> float:
-    if not results:
-        return 0.0
-    real = [
-        1.0 if result.get("sampling", {}).get("source_kind") != "synthetic" else 0.0
-        for result in results
-    ]
-    return round(float(np.mean(real)), 6)
-
-
-def _generation_rate(results: list[dict[str, Any]], source: str) -> float:
-    if not results:
-        return 0.0
-    return round(
-        float(np.mean([1.0 if result.get("generation_source") == source else 0.0 for result in results])),
-        6,
+def _efficiency_summary(results: list[dict[str, Any]]) -> dict[str, float]:
+    keys = (
+        "sampling_seconds",
+        "reward_encoding_seconds",
+        "generation_seconds",
+        "generation_requests",
+        "generation_input_tokens",
+        "generation_output_tokens",
+        "generation_total_tokens",
+        "reward_scoring_seconds",
+        "metric_evaluation_seconds",
+        "direct_generation_seconds",
+        "stars_seconds",
+        "direct_generation_input_tokens",
+        "stars_input_tokens",
+        "direct_generation_output_tokens",
+        "stars_output_tokens",
+        "direct_generation_total_tokens",
+        "stars_total_tokens",
+        "direct_generation_requests",
+        "stars_generation_requests",
+        "total_pipeline_seconds",
+        "vlm_server_peak_allocated_mib",
+        "vlm_server_peak_reserved_mib",
+        "reward_runner_peak_allocated_mib",
+        "reward_runner_peak_reserved_mib",
     )
+    summary: dict[str, float] = {}
+    for key in keys:
+        values = [
+            float(result["efficiency"][key])
+            for result in results
+            if key in result.get("efficiency", {})
+        ]
+        if not values:
+            continue
+        summary[f"mean_{key}"] = round(float(np.mean(values)), 6)
+        summary[f"median_{key}"] = round(float(np.median(values)), 6)
+        summary[f"p95_{key}"] = round(float(np.percentile(values, 95)), 6)
+    return summary
 
 
-def _counts(values) -> dict[str, int]:
+def _candidate_pool_integrity_summary(
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    slots = [
+        slot
+        for result in results
+        for slot in result.get("slot_outcomes", [])
+    ]
+    attempts = [
+        attempt
+        for slot in slots
+        for attempt in slot.get("attempts", [])
+    ]
+    valid_slots = sum(slot.get("terminal_status") == "valid" for slot in slots)
+    failed_slots = sum(slot.get("terminal_status") == "failed" for slot in slots)
+    full_pools = sum(
+        int(result.get("valid_candidate_slots", 0))
+        == int(result.get("requested_candidate_slots", 0))
+        for result in results
+    )
+    return {
+        "requested_candidate_slot_count": len(slots),
+        "valid_candidate_slot_count": valid_slots,
+        "failed_candidate_slot_count": failed_slots,
+        "candidate_slot_success_rate": round(
+            valid_slots / max(1, len(slots)),
+            6,
+        ),
+        "full_candidate_pool_sample_count": full_pools,
+        "full_candidate_pool_sample_rate": round(
+            full_pools / max(1, len(results)),
+            6,
+        ),
+        "generation_attempt_count": len(attempts),
+        "generation_parse_rejection_count": sum(
+            attempt.get("status") == "parse_rejected" for attempt in attempts
+        ),
+        "generation_endpoint_error_count": sum(
+            attempt.get("status") == "endpoint_error" for attempt in attempts
+        ),
+        "generation_validation_retry_count": sum(
+            attempt.get("prompt_kind") == "validation_retry"
+            for attempt in attempts
+        ),
+    }
+
+
+def _optional_mean(values: Iterable[float | None]) -> float | None:
+    present = [float(value) for value in values if value is not None]
+    if not present:
+        return None
+    return round(float(np.mean(present)), 6)
+
+
+def _mean(values: Iterable[float]) -> float:
+    present = list(values)
+    if not present:
+        return 0.0
+    return round(float(np.mean(present)), 6)
+
+
+def _counts(values: Iterable[Any]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for value in values:
         key = str(value)
         counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value)

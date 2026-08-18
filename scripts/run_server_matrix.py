@@ -5,29 +5,92 @@ import json
 import os
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from creative_video_exp.checkpoint_identity import (
+    LOCAL_CHECKPOINT_KIND,
+    checkpoint_identity_summary,
+    load_checkpoint_manifest,
+    validate_checkpoint_identity,
+)
+
+FORMAL_REWARD_WEIGHTS = {
+    "alignment_weight": 6.0 / 17.0,
+    "readability_weight": 3.0 / 17.0,
+    "rhythm_weight": 3.0 / 17.0,
+    "control_weight": 4.0 / 17.0,
+    "risk_weight": 1.0 / 17.0,
+}
 
 SUMMARY_KEYS = [
+    "requested_num_samples",
+    "completed_num_samples",
+    "fully_accounted_sample_count",
+    "requested_candidate_slot_count",
+    "valid_candidate_slot_count",
+    "failed_candidate_slot_count",
+    "candidate_slot_success_rate",
+    "full_candidate_pool_sample_count",
+    "full_candidate_pool_sample_rate",
+    "any_valid_candidate_sample_count",
+    "any_valid_candidate_sample_rate",
+    "generation_success_rate",
+    "unresolved_generation_failure_count",
+    "evidence_eligible",
     "num_samples",
     "num_candidates",
-    "preference_pairs",
     "real_video_rate",
     "multimodal_generation_rate",
     "control_success_rate_best",
+    "control_violation_counts_best",
     "constraint_violation_rate_best",
     "mean_best_reward",
     "mean_best_alignment",
-    "mean_text_reasoning",
-    "mean_bleu_4",
-    "mean_rouge_l",
-    "mean_meteor",
-    "mean_cider_lite",
-    "answer_hit_rate",
-    "selling_point_coverage",
+    "best_mean_bleu_4",
+    "best_mean_rouge_l",
+    "best_mean_meteor",
+    "best_mean_semantic_point_coverage",
+    "semantic_point_valid_sample_count",
+    "semantic_point_valid_sample_rate",
+    "best_mean_cider_lite",
+    "best_mean_repetition_rate",
+    "best_mean_english_token_rate",
+    "non_latin_on_screen_text_candidate_rate_best",
+    "mean_on_screen_text_non_latin_letter_rate_best",
+    "generation_validation_retry_prompt_attempts",
+    "generation_degenerate_repetition_early_stops",
+    "failed_generation_attempt_records",
+    "failed_generation_repetition_early_stops",
+    "failed_generation_total_tokens",
+    "failed_generation_seconds",
+    "best_answer_hit_rate",
+    "mean_generation_seconds",
+    "mean_generation_input_tokens",
+    "mean_generation_output_tokens",
+    "mean_generation_total_tokens",
+    "mean_reward_encoding_seconds",
+    "mean_reward_scoring_seconds",
+    "mean_total_pipeline_seconds",
+    "mean_reward_runner_peak_allocated_mib",
+    "mean_online_baseline_seconds",
+    "mean_online_best_of_4_seconds",
+    "mean_best_of_1_total_tokens",
+    "mean_best_of_4_total_tokens",
+    "mean_best_of_1_generation_requests",
+    "mean_best_of_4_generation_requests",
+    "risk_violation_rate_best",
+    "mean_vlm_server_peak_allocated_mib",
+    "mean_vlm_server_peak_reserved_mib",
 ]
 
 DATASETS = {
@@ -40,7 +103,7 @@ DATASETS = {
         "default_annotation": "",
         "default_video_root": "",
         "video_search_dirs": ["videos", "video", "clips", "all_videos", ""],
-        "selling_points": ["视觉证据", "时间线线索", "答案支撑"],
+        "salient_points": [],
     },
     "cgbench": {
         "name": "cg-bench",
@@ -49,7 +112,7 @@ DATASETS = {
         "default_annotation": "",
         "default_video_root": "",
         "video_search_dirs": ["videos", "video", "clips", "all_videos", "clue_video", "clue_videos", ""],
-        "selling_points": ["视觉证据", "关键信息", "行动引导"],
+        "salient_points": [],
     },
     "videomme": {
         "name": "video-mme",
@@ -58,7 +121,7 @@ DATASETS = {
         "default_annotation": "",
         "default_video_root": "",
         "video_search_dirs": ["videos", "video", "clips", "data", ""],
-        "selling_points": ["视觉证据", "字幕线索", "答案支撑"],
+        "salient_points": [],
     },
 }
 
@@ -66,43 +129,48 @@ MODELS = {
     "llava_video_qwen2": {
         "id": "llava_video_7b_qwen2",
         "name": "LLaVA-Video-7B-Qwen2",
-        "role": "main_multimodal_generator_and_aligner",
+        "role": "main_multimodal_generator",
         "endpoint_env": "LLAVA_VIDEO_ENDPOINT_URL",
         "adapter": "chat_completions_multimodal",
+        "checkpoint_manifest_env": "LLAVA_VIDEO_CHECKPOINT_MANIFEST",
     },
     "internvl25_8b": {
         "id": "internvl25_8b",
         "name": "InternVL2.5-8B",
-        "role": "baseline_multimodal_generator_and_aligner",
+        "role": "baseline_multimodal_generator",
         "endpoint_env": "INTERNVL25_ENDPOINT_URL",
         "adapter": "chat_completions_multimodal",
+        "checkpoint_manifest_env": "INTERNVL25_CHECKPOINT_MANIFEST",
     },
     "videollama2_7b_16f": {
         "id": "videollama2_7b_16f",
         "name": "VideoLLaMA2-7B-16F",
-        "role": "baseline_multimodal_generator_and_aligner",
+        "role": "baseline_multimodal_generator",
         "endpoint_env": "VIDEOLLAMA2_ENDPOINT_URL",
         "adapter": "chat_completions_multimodal",
+        "checkpoint_manifest_env": "VIDEOLLAMA2_CHECKPOINT_MANIFEST",
     },
 }
+DEFAULT_MODELS = ["llava_video_qwen2", "internvl25_8b", "videollama2_7b_16f"]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the full server experiment matrix.")
+    parser = argparse.ArgumentParser(description="Run the full STARS experiment matrix.")
     parser.add_argument("--datasets", nargs="+", default=list(DATASETS), choices=list(DATASETS))
-    parser.add_argument("--models", nargs="+", default=list(MODELS), choices=list(MODELS))
-    parser.add_argument("--limit", type=int, default=int(os.environ.get("EXPERIMENT_LIMIT", "0")))
-    parser.add_argument("--offset", type=int, default=int(os.environ.get("EXPERIMENT_OFFSET", "0")))
-    parser.add_argument("--num-candidates", type=int, default=4)
-    parser.add_argument("--max-frames", type=int, default=16)
-    parser.add_argument("--image-size", type=int, default=224)
-    parser.add_argument("--output-root", default=os.environ.get("EXPERIMENT_OUTPUT_ROOT", "outputs/server_matrix"))
-    parser.add_argument("--config-dir", default=os.environ.get("EXPERIMENT_CONFIG_DIR", "outputs/server_matrix_configs"))
-    parser.add_argument("--text-reward", choices=["deepseek", "llama33", "none"], default=os.environ.get("TEXT_REWARD_KIND", "none"))
-    parser.add_argument("--no-strict-video", action="store_true")
-    parser.add_argument("--no-resume", action="store_true")
-    parser.add_argument("--no-ranker", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=DEFAULT_MODELS,
+        choices=list(MODELS),
+    )
+    parser.add_argument(
+        "--output-root",
+        default=os.environ.get("EXPERIMENT_OUTPUT_ROOT", "outputs/full"),
+    )
+    parser.add_argument(
+        "--config-dir",
+        default=os.environ.get("EXPERIMENT_CONFIG_DIR", "outputs/full_configs"),
+    )
     return parser.parse_args()
 
 
@@ -111,10 +179,19 @@ def main() -> None:
     config_dir = PROJECT_ROOT / args.config_dir
     config_dir.mkdir(parents=True, exist_ok=True)
     rows = []
+    model_bindings, reward_binding = _prepare_checkpoint_identities(args.models)
 
     for dataset_key in args.datasets:
         for model_key in args.models:
-            config = build_config(dataset_key, model_key, args)
+            config = build_config(
+                dataset_key,
+                model_key,
+                args,
+                model_identity=model_bindings[model_key]["identity"],
+                model_manifest_path=model_bindings[model_key]["manifest_path"],
+                reward_identity=reward_binding["identity"],
+                reward_manifest_path=reward_binding["manifest_path"],
+            )
             config_path = config_dir / f"{dataset_key}__{model_key}.json"
             config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
             command = [
@@ -122,21 +199,11 @@ def main() -> None:
                 "scripts/run_experiment.py",
                 "--config",
                 str(config_path),
-                "--strict-model",
+                "--resume",
             ]
-            if not args.no_strict_video:
-                command.append("--strict-video")
-            if not args.no_resume:
-                command.append("--resume")
-            if args.no_ranker:
-                command.append("--no-ranker")
 
             print(f"\n>>> {dataset_key} / {model_key}")
             print(" ".join(command))
-            if args.dry_run:
-                rows.append({"dataset": dataset_key, "model": model_key, "config_path": str(config_path)})
-                continue
-
             subprocess.run(command, cwd=PROJECT_ROOT, check=True)
             metrics_path = PROJECT_ROOT / config["output_dir"] / "metrics.json"
             metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
@@ -159,7 +226,16 @@ def main() -> None:
     print(f"\nSummary written to {summary_dir}")
 
 
-def build_config(dataset_key: str, model_key: str, args: argparse.Namespace) -> dict[str, Any]:
+def build_config(
+    dataset_key: str,
+    model_key: str,
+    args: argparse.Namespace,
+    *,
+    model_identity: dict[str, Any] | None = None,
+    model_manifest_path: str = "",
+    reward_identity: dict[str, Any] | None = None,
+    reward_manifest_path: str = "",
+) -> dict[str, Any]:
     dataset = DATASETS[dataset_key]
     model = MODELS[model_key]
     annotation_path = _env(
@@ -180,117 +256,253 @@ def build_config(dataset_key: str, model_key: str, args: argparse.Namespace) -> 
         raise RuntimeError(
             f"Missing video root for {dataset_key}. Set {dataset['video_root_env']}."
         )
-    endpoint_url = _env(model["endpoint_env"], "VLM_ENDPOINT_URL", default="")
+    endpoint_url = _env(
+        model["endpoint_env"],
+        "VLM_ENDPOINT_URL",
+        default=model.get("default_endpoint", ""),
+    )
     if not endpoint_url:
         raise RuntimeError(
             f"Missing endpoint for {model_key}. Set {model['endpoint_env']} or VLM_ENDPOINT_URL."
         )
-
-    text_reward = _text_reward_endpoint(args.text_reward)
-    if text_reward and not text_reward["endpoint_url"]:
-        raise RuntimeError(
-            "Missing text-only reward endpoint. Set TEXT_REWARD_ENDPOINT_URL "
-            "or run with --text-reward none."
-        )
+    api_key_env = model.get("api_key_env", "VLM_API_KEY")
     output_dir = f"{args.output_root}/{dataset_key}/{model_key}"
+    if model_identity is None:
+        raise RuntimeError(
+            f"Formal local model identity was not resolved for {model_key}."
+        )
+    validate_checkpoint_identity(model_identity)
+    reward_vision = _reward_vision_endpoint(
+        reward_identity,
+        checkpoint_manifest_path=reward_manifest_path,
+    )
     return {
+        "experiment_version": "stars",
         "seed": 42,
         "data": {
             "name": dataset["name"],
             "annotation_path": annotation_path,
             "video_root": video_root,
             "video_search_dirs": dataset["video_search_dirs"],
-            "offset": args.offset,
-            "limit": args.limit,
         },
         "sampling": {
             "num_bins": 8,
             "frames_per_bin": 2,
-            "max_frames": args.max_frames,
-            "synthetic_size": args.image_size,
+            "max_frames": 16,
+            "image_size": 224,
         },
         "generation": {
-            "num_candidates": args.num_candidates,
+            "num_candidates": 4,
+            "input_protocol": "visual_only",
+            "prompt_version": "stars_visual_only_fixed_validation_retry_v2",
+            "candidate_generation_protocol": "independent_single_candidate_calls",
+            "parse_retry_count": 7,
+            "pre_score_processing": "json_envelope_and_schema_canonicalization_only",
+            "candidate_slot_failure_policy": "retain_invalid_slot_and_continue",
+            "method_failure_aggregation": "conditional_and_failure_aware_effective",
             "target_duration_sec": 30,
             "segments": 5,
-            "cta_position": "late",
+            "output_language": "English",
+            "summary_position": "late",
             "pace": "medium",
             "information_density": "medium",
-            "selling_points": dataset["selling_points"],
-            "risk_terms": ["绝对", "第一", "治愈", "稳赚", "包治", "最低价"],
+            "target_words_per_segment": 12,
+            "min_words_per_segment": 6,
+            "max_words_per_segment": 18,
+            "salient_points": dataset["salient_points"],
+            "risk_terms": [
+                "absolute",
+                "guaranteed",
+                "cure",
+                "risk-free",
+                "lowest price",
+                "number one",
+                "best",
+            ],
         },
         "reward": {
-            "alignment_weight": 0.3,
-            "readability_weight": 0.15,
-            "rhythm_weight": 0.15,
-            "control_weight": 0.2,
-            "risk_weight": 0.05,
-            "text_reasoning_weight": 0.15 if text_reward else 0.0,
-            "preference_margin": 0.08,
+            **FORMAL_REWARD_WEIGHTS,
+            "visual_grounding_balance": 0.5,
+            "text_anchor_semantic_balance": 0.7,
+        },
+        "evaluation": {
+            "semantic_point_coverage_enabled": True,
+            "semantic_point_reference_policy": "annotation_only",
+            "semantic_point_encoder": "active_reward_encoder_text_tower",
+            "semantic_point_similarity_threshold": 0.50,
+            "semantic_point_text_fields": [
+                "narration",
+                "on_screen_text",
+                "salient_point",
+            ],
         },
         "models": {
             "mode": "server_full_matrix",
             "active_video_model": model["id"],
-            "active_text_reward_model": text_reward["id"] if text_reward else "",
-            "allow_heavy_model_load": True,
+            "active_reward_vision_model": reward_vision["id"],
             "endpoints": [
                 {
                     "id": model["id"],
                     "name": model["name"],
                     "role": model["role"],
-                    "provider": "openai_compatible",
+                    "provider": model.get("provider", "openai_compatible"),
                     "adapter": model["adapter"],
                     "enabled": True,
                     "endpoint_url": endpoint_url,
-                    "api_key_env": "VLM_API_KEY",
-                    "max_frames": args.max_frames,
-                    "max_new_tokens": 1200,
+                    "api_key_env": api_key_env,
+                    "max_frames": 16,
+                    "max_new_tokens": 900,
                     "temperature": float(os.environ.get("VLM_TEMPERATURE", "0.3")),
                     "request_timeout_sec": 300,
                     "retry_count": 2,
+                    "seed": 42,
+                    "checkpoint_identity": model_identity,
+                    "checkpoint_manifest_path": model_manifest_path,
                     "notes": "Server-hosted OpenAI-compatible multimodal VLM endpoint.",
                 },
-                *([text_reward] if text_reward else []),
+                reward_vision,
             ],
         },
         "output_dir": output_dir,
     }
 
 
-def _text_reward_endpoint(kind: str) -> dict[str, Any] | None:
-    if kind == "none":
-        return None
-    if kind == "llama33":
-        return {
-            "id": "llama33_70b_8bit_text_reward",
-            "name": os.environ.get("LLAMA33_TEXT_REWARD_MODEL", "Llama-3.3-70B 8-bit"),
-            "role": "text_only_reward_reasoning",
-            "provider": "openai_compatible_text",
-            "adapter": "chat_completions_text_reward",
-            "enabled": True,
-            "endpoint_url": _env("LLAMA33_TEXT_REWARD_ENDPOINT_URL", "TEXT_REWARD_ENDPOINT_URL", default=""),
-            "api_key_env": "TEXT_REWARD_API_KEY",
-            "max_new_tokens": 768,
-            "temperature": 0.0,
-            "request_timeout_sec": 240,
-            "retry_count": 2,
-            "quantization": "8bit",
-            "notes": "Text-only reward/reasoning module; it never receives video frames.",
+def _prepare_checkpoint_identities(
+    model_keys: list[str],
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    reward_manifest_path = os.environ.get(
+        "REWARD_VISION_CHECKPOINT_MANIFEST", ""
+    ).strip()
+    if not reward_manifest_path:
+        raise RuntimeError(
+            "Set REWARD_VISION_CHECKPOINT_MANIFEST to the formal SigLIP2 sidecar."
+        )
+    reward_model_path = os.environ.get("REWARD_VISION_MODEL_PATH", "").strip()
+    if not reward_model_path:
+        raise RuntimeError("Set REWARD_VISION_MODEL_PATH to the local SigLIP2 checkpoint.")
+    reward_manifest = load_checkpoint_manifest(
+        reward_manifest_path,
+        model_path=reward_model_path,
+        verify_files=True,
+    )
+    reward_identity = checkpoint_identity_summary(reward_manifest)
+    if reward_identity["model_id"] != "google/siglip2-so400m-patch14-384":
+        raise RuntimeError("Reward checkpoint sidecar identifies the wrong model.")
+
+    bindings: dict[str, dict[str, Any]] = {}
+    for model_key in model_keys:
+        model = MODELS[model_key]
+        manifest_env = str(model.get("checkpoint_manifest_env", ""))
+        manifest_path = os.environ.get(manifest_env, "").strip()
+        if not manifest_path:
+            raise RuntimeError(
+                f"Set {manifest_env} to the checkpoint sidecar for {model_key}."
+            )
+        expected_manifest = load_checkpoint_manifest(manifest_path)
+        expected_identity = checkpoint_identity_summary(expected_manifest)
+        if expected_identity["model_id"] != model["name"]:
+            raise RuntimeError(
+                f"{manifest_env} model_id does not equal {model['name']!r}."
+            )
+        endpoint_url = _env(
+            model["endpoint_env"],
+            "VLM_ENDPOINT_URL",
+            default=model.get("default_endpoint", ""),
+        )
+        if not endpoint_url:
+            raise RuntimeError(
+                f"Missing endpoint for {model_key}. Set {model['endpoint_env']}."
+            )
+        observed_identity = _query_local_service_checkpoint_identity(
+            endpoint_url,
+            api_key_env=model.get("api_key_env", "VLM_API_KEY"),
+            expected_model_id=model["name"],
+        )
+        if observed_identity != expected_identity:
+            raise RuntimeError(
+                f"Live service checkpoint identity differs from {manifest_env}."
+            )
+        bindings[model_key] = {
+            "identity": expected_identity,
+            "manifest_path": str(Path(manifest_path).expanduser().resolve()),
         }
+    return bindings, {
+        "identity": reward_identity,
+        "manifest_path": str(Path(reward_manifest_path).expanduser().resolve()),
+    }
+
+
+def _query_local_service_checkpoint_identity(
+    endpoint_url: str,
+    *,
+    api_key_env: str,
+    expected_model_id: str,
+) -> dict[str, Any]:
+    parts = urllib.parse.urlsplit(endpoint_url)
+    path = parts.path.rstrip("/")
+    for suffix in ("/chat/completions", "/responses"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    models_url = urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, f"{path}/models", "", "")
+    )
+    headers: dict[str, str] = {}
+    api_key = os.environ.get(api_key_env, "") if api_key_env else ""
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(models_url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Could not audit the live model service at {models_url}: {exc}"
+        ) from exc
+    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    matches = [
+        item
+        for item in rows
+        if isinstance(item, dict) and item.get("id") == expected_model_id
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Service must advertise exactly one {expected_model_id!r} model identity."
+        )
+    identity = matches[0].get("checkpoint_identity", {})
+    validate_checkpoint_identity(identity)
+    if identity.get("kind") != LOCAL_CHECKPOINT_KIND:
+        raise RuntimeError("Local service returned a non-local checkpoint identity.")
+    if identity.get("model_id") != expected_model_id:
+        raise RuntimeError("Service checkpoint identity model_id is inconsistent.")
+    return identity
+
+
+def _reward_vision_endpoint(
+    checkpoint_identity: dict[str, Any] | None = None,
+    *,
+    checkpoint_manifest_path: str = "",
+) -> dict[str, Any]:
+    if checkpoint_identity is None:
+        raise RuntimeError("Formal reward checkpoint identity was not resolved.")
+    validate_checkpoint_identity(checkpoint_identity)
     return {
-        "id": "deepseek_r1_text_reward",
-        "name": os.environ.get("DEEPSEEK_TEXT_REWARD_MODEL", "DeepSeek-R1"),
-        "role": "text_only_reward_reasoning",
-        "provider": "openai_compatible_text",
-        "adapter": "chat_completions_text_reward",
+        "id": "siglip2_so400m_patch14_384_reward",
+        "name": "google/siglip2-so400m-patch14-384",
+        "role": "frozen_vision_text_reward_encoder",
+        "provider": "huggingface_local",
+        "adapter": "siglip2_frame_encoder",
         "enabled": True,
-        "endpoint_url": _env("DEEPSEEK_TEXT_REWARD_ENDPOINT_URL", "TEXT_REWARD_ENDPOINT_URL", default=""),
-        "api_key_env": "TEXT_REWARD_API_KEY",
-        "max_new_tokens": 768,
-        "temperature": 0.0,
-        "request_timeout_sec": 240,
-        "retry_count": 2,
-        "notes": "Text-only reward/reasoning module; it never receives video frames.",
+        "local_path": os.environ["REWARD_VISION_MODEL_PATH"],
+        "device_map": os.environ.get("REWARD_VISION_DEVICE", "cuda:0"),
+        "dtype": os.environ.get("REWARD_VISION_DTYPE", "bfloat16"),
+        "trust_remote_code": False,
+        "checkpoint_identity": checkpoint_identity,
+        "checkpoint_manifest_path": checkpoint_manifest_path,
+        "notes": (
+            "Frozen independent SigLIP2 encoder for frame embeddings, text embeddings, "
+            "coarse visual tags, and formal alignment reward."
+        ),
     }
 
 
@@ -303,7 +515,7 @@ def _env(primary: str, fallback: str = "", default: str = "") -> str:
 
 def _markdown_summary(rows: list[dict[str, Any]]) -> str:
     lines = [
-        "# Server Experiment Matrix",
+        "# STARS Experiment Matrix",
         "",
         "| Dataset | Model | " + " | ".join(SUMMARY_KEYS) + " |",
         "| --- | --- | " + " | ".join(["---:"] * len(SUMMARY_KEYS)) + " |",

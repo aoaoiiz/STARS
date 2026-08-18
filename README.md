@@ -1,35 +1,34 @@
-# STARS: Structured Video Script Generation with Self-Reward Selection
+# STARS: Structured Timeline Alignment and Rewarded Selection
 
-STARS is an inference-time framework for structured video script generation. Given a video, STARS sparsely samples visual frames, asks a multimodal video-language model to generate multiple structured script candidates, and selects the final script with a reproducible composite self-reward.
+STARS is a training-free framework for structured video script generation. It samples a sparse temporal observation, obtains four structured candidates from a video-language model, scores each candidate with a fixed five-component self-reward, and returns the highest-reward candidate.
 
-The repository contains the experiment pipeline used for three video-language models and three video benchmarks:
+This repository contains only the main experiment pipeline for LLaVA-Video-7B-Qwen2, InternVL2.5-8B, and VideoLLaMA2-7B-16F on LongVideoBench, CG-Bench, and Video-MME. The released setting is fixed to four candidates, sixteen binwise-sampled frames, English output, five timeline segments, and the frozen SigLIP2 reward encoder. Sampling, candidate-count, reward-component, and auxiliary analysis utilities are not included.
 
-- Models: LLaVA-Video-7B-Qwen2, InternVL2.5-8B, and VideoLLaMA2-7B-16F.
-- Datasets: LongVideoBench, CG-Bench, and Video-MME.
-- Main setting: full-dataset evaluation, `num_candidates=4`, `max_frames=16`, no text-only reward model, and no learned ranker.
+## Full-data policy
 
-Datasets, model checkpoints, generated videos, and experimental outputs are not included. Please download them from their official sources and configure paths through environment variables.
+STARS processes every row in each supplied annotation file. The code contains no sample limit, offset, subset sampler, or replacement-sample mechanism. For a full-dataset experiment, each annotation path must therefore point to the complete official annotation manifest. Missing or undecodable videos stop the run instead of reducing the evaluation set.
 
-## Repository Layout
+Semantic Point Coverage is evaluation-only. The complete annotation manifest must contain a non-empty `semantic_points` field for every row and the required top-level reference-protocol metadata. `scripts/build_semantic_point_manifests.py` creates these fields deterministically from the official question and resolved correct answer without changing the number or order of rows.
+
+## Repository layout
 
 ```text
-configs/
-  full/                    # 3 datasets x 3 models, full-dataset configs
-  smoke.json               # lightweight local smoke test
 scripts/
-  run_experiment.py         # single config runner
-  run_server_matrix.py      # full matrix runner
-  serve_llava_video_openai.py
+  build_checkpoint_manifest.py
+  build_semantic_point_manifests.py
+  run_experiment.py
+  run_server_matrix.py
   serve_internvl_openai.py
+  serve_llava_video_openai.py
   serve_videollama2_openai.py
-src/creative_video_exp/     # STARS pipeline
-sample_data/                # tiny smoke-test annotations
-tests/                      # unit tests
-REPRODUCE.md                # full-dataset reproduction guide
+src/creative_video_exp/
 requirements.txt
+requirements-internvl.txt
 ```
 
 ## Installation
+
+Use one environment for the experiment runner and reward encoder:
 
 ```bash
 python -m venv .venv
@@ -37,81 +36,119 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-For real video decoding and model serving, install the optional dependencies required by your chosen model implementation, such as `transformers`, `opencv-python`, `decord`, `fastapi`, `uvicorn`, and the corresponding upstream model repositories.
+The three generation backbones should use separate environments because their upstream repositories may require different dependency versions. Install the official LLaVA-Video and VideoLLaMA2 repositories in their respective environments. For InternVL2.5-8B, install `requirements-internvl.txt` in its service environment. When a VideoLLaMA2 checkout forces FlashAttention2 for the CLIP vision tower, configure that vision tower to use the eager attention backend; the model checkpoint itself is unchanged.
 
-## Quick Smoke Test
+## Prepare full annotation manifests
 
-The smoke test uses synthetic or local lightweight frames and does not require large model checkpoints.
+Run the following command once for each complete official annotation file:
 
 ```bash
-python scripts/run_experiment.py --config configs/smoke.json --no-ranker
-python -m unittest discover tests
+python scripts/build_semantic_point_manifests.py \
+  --dataset longvideobench \
+  --input /path/to/full-official-annotations.json \
+  --output /path/to/full-annotations-with-semantic-points.json
 ```
 
-## Full-Dataset Experiments
+Use `cgbench` and `videomme` for the other datasets. The output contains all source rows.
 
-Full-dataset configs are stored under `configs/full/`. They use `limit: 0`, which means all samples from the provided annotation file are evaluated.
+## Bind model checkpoints
 
-Before running, set dataset paths:
+Create one sidecar for each local generation checkpoint and for the SigLIP2 reward checkpoint:
 
 ```bash
-export LONGBENCH_ANNOTATION_PATH=/path/to/LongVideoBench/lvb_val.json
-export LONGBENCH_VIDEO_ROOT=/path/to/LongVideoBench/videos
-
-export CGBENCH_ANNOTATION_PATH=/path/to/CG-Bench/cgbench.json
-export CGBENCH_VIDEO_ROOT=/path/to/CG-Bench
-
-export VIDEOMME_ANNOTATION_PATH=/path/to/Video-MME/video_mme_annotations_prq.json
-export VIDEOMME_VIDEO_ROOT=/path/to/Video-MME
+python scripts/build_checkpoint_manifest.py \
+  --model-path /path/to/checkpoint \
+  --model-id exact-model-id \
+  --revision immutable-revision \
+  --output /path/to/checkpoint-manifest.json
 ```
 
-Set OpenAI-compatible multimodal endpoints:
+The required model IDs are `LLaVA-Video-7B-Qwen2`, `InternVL2.5-8B`, `VideoLLaMA2-7B-16F`, and `google/siglip2-so400m-patch14-384`.
+
+## Start a generation service
+
+Each wrapper exposes an OpenAI-compatible local endpoint. The following examples use loopback addresses only; choose any free local ports.
 
 ```bash
-export LLAVA_VIDEO_ENDPOINT_URL=http://<llava-host>:<port>/v1/chat/completions
-export INTERNVL25_ENDPOINT_URL=http://<internvl-host>:<port>/v1/chat/completions
-export VIDEOLLAMA2_ENDPOINT_URL=http://<videollama2-host>:<port>/v1/chat/completions
+python scripts/serve_llava_video_openai.py \
+  --model-path /path/to/LLaVA-Video-7B-Qwen2 \
+  --model-name llava_qwen \
+  --served-model-name LLaVA-Video-7B-Qwen2 \
+  --checkpoint-manifest /path/to/llava-checkpoint-manifest.json \
+  --host 127.0.0.1 \
+  --port 8010 \
+  --max-frames 16
+```
+
+```bash
+python scripts/serve_internvl_openai.py \
+  --model-path /path/to/InternVL2_5-8B \
+  --served-model-name InternVL2.5-8B \
+  --checkpoint-manifest /path/to/internvl-checkpoint-manifest.json \
+  --host 127.0.0.1 \
+  --port 8011 \
+  --max-frames 16 \
+  --image-size 448
+```
+
+```bash
+python scripts/serve_videollama2_openai.py \
+  --model-path /path/to/VideoLLaMA2-7B-16F \
+  --repo-path /path/to/VideoLLaMA2 \
+  --served-model-name VideoLLaMA2-7B-16F \
+  --checkpoint-manifest /path/to/videollama2-checkpoint-manifest.json \
+  --host 127.0.0.1 \
+  --port 8012 \
+  --max-frames 16
+```
+
+## Configure datasets, endpoints, and reward encoder
+
+```bash
+export LONGBENCH_ANNOTATION_PATH=/path/to/full-longvideobench-manifest.json
+export LONGBENCH_VIDEO_ROOT=/path/to/longvideobench-videos
+export CGBENCH_ANNOTATION_PATH=/path/to/full-cgbench-manifest.json
+export CGBENCH_VIDEO_ROOT=/path/to/cgbench-videos
+export VIDEOMME_ANNOTATION_PATH=/path/to/full-videomme-manifest.json
+export VIDEOMME_VIDEO_ROOT=/path/to/videomme-videos
+
+export LLAVA_VIDEO_ENDPOINT_URL=http://127.0.0.1:8010/v1/chat/completions
+export INTERNVL25_ENDPOINT_URL=http://127.0.0.1:8011/v1/chat/completions
+export VIDEOLLAMA2_ENDPOINT_URL=http://127.0.0.1:8012/v1/chat/completions
+
+export LLAVA_VIDEO_CHECKPOINT_MANIFEST=/path/to/llava-checkpoint-manifest.json
+export INTERNVL25_CHECKPOINT_MANIFEST=/path/to/internvl-checkpoint-manifest.json
+export VIDEOLLAMA2_CHECKPOINT_MANIFEST=/path/to/videollama2-checkpoint-manifest.json
+
+export REWARD_VISION_MODEL_PATH=/path/to/siglip2-so400m-patch14-384
+export REWARD_VISION_CHECKPOINT_MANIFEST=/path/to/siglip2-checkpoint-manifest.json
+export REWARD_VISION_DEVICE=cuda:0
+export REWARD_VISION_DTYPE=bfloat16
 export VLM_TEMPERATURE=0.3
 ```
 
-Run the full matrix:
+## Run the main experiment
+
+If all three services are available, run the complete matrix:
 
 ```bash
 python scripts/run_server_matrix.py \
   --datasets longvideobench cgbench videomme \
   --models llava_video_qwen2 internvl25_8b videollama2_7b_16f \
-  --limit 0 \
-  --num-candidates 4 \
-  --max-frames 16 \
-  --text-reward none \
-  --no-ranker \
   --output-root outputs/full \
   --config-dir outputs/full_configs
 ```
 
-See [REPRODUCE.md](REPRODUCE.md) for model-serving commands and individual config examples.
+On a single GPU, start one generation service at a time and run the same command with one model name. Every selected dataset is still evaluated on all rows in its annotation file.
+
+Use a new output directory when replacing an earlier release. Protocol identifiers and checkpoint manifests are validated before a run can resume.
 
 ## Outputs
 
-Each run writes:
+Each model-dataset run writes `results.jsonl`, `generation_failures.jsonl`, `run_status.json`, `protocol_manifest.json`, `metrics.json`, `metrics_report.md`, and `candidate_pool_analysis/`. The matrix root also contains `summary.json` and `summary.md`.
 
-- `results.jsonl`: sample-level candidates, reward details, selected best candidate, and metadata.
-- `metrics.json`: aggregate metrics.
-- `metrics_report.md`: a readable summary.
-- `preference_pairs.jsonl`: self-reward preference pairs.
+The primary reported quantities are Reward, MV-Align, Control Success Rate, Semantic Point Coverage, CIDEr-lite, and repetition rate. Direct Generation is the first candidate. STARS selects the valid candidate with the highest composite Reward among the four requested candidate slots. Metric-wise Best@4 is reported only as a non-deployable upper bound over the same candidate pool.
 
-The key paper metrics are:
+## Data and model licenses
 
-- `mean_best_reward`: composite self-reward.
-- `mean_best_alignment`: multimodal video-script alignment.
-- `control_success_rate_best`: structural control success rate.
-- `selling_point_coverage`: selling-point coverage.
-- `mean_cider_lite`: lightweight CIDEr-style reference score.
-- `mean_repetition_rate`: repetition rate, lower is better.
-
-## Notes
-
-- STARS does not train or fine-tune the base video-language models.
-- The benchmark question-answer annotations may be loaded as dataset metadata and weak references, but the task is structured video script generation rather than video question answering.
-- The repository does not redistribute benchmark videos or model checkpoints. Users are responsible for following the original licenses.
-
+Dataset videos, annotations, model repositories, and checkpoints are not redistributed. Obtain them from their official sources and follow their respective licenses and access conditions.
