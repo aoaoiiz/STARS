@@ -10,6 +10,14 @@ Each video is represented by up to 16 frames selected from eight temporal bins. 
 
 Semantic Point Coverage is evaluation-only. Questions, answers, captions, subtitles, transcripts, reference descriptions, and semantic-point references are not supplied to the generator or reward model.
 
+## Human evaluation
+
+Individual human ratings, the evaluation protocol, and the original Excel files are available in [HumanEvaluation](HumanEvaluation/). The evaluation covers 60 videos, with 20 from each dataset, and involves 36 evaluators.
+
+## Supplementary material
+
+The supplementary material for the paper is available in [SupplementaryMaterial](SupplementaryMaterial/).
+
 ## Installation
 
 ```bash
@@ -37,11 +45,15 @@ Each dataset-model directory contains the protocol manifest, run status, per-vid
 
 ## Repository layout
 
+## Repository layout
+
 - `src/creative_video_exp`: sampling, generation, reward, evaluation, provenance, and reporting
 - `scripts`: experiment entry points, model services, checkpoint registration, and evidence compilation
 - `configs`: dataset path examples
 - `docs`: metric contracts
 - `tests`: protocol and implementation tests
+- `HumanEvaluation`: individual human ratings, evaluation protocol, and original Excel files
+- `SupplementaryMaterial`: supplementary material for the paper
 
 ## License
 
